@@ -37,8 +37,8 @@ func Open(path string) (*Store, error) {
 func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) migrate() error {
-	_, err := s.db.Exec(`
-CREATE TABLE IF NOT EXISTS pods (
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS pods (
 	name TEXT PRIMARY KEY,
 	namespace TEXT NOT NULL DEFAULT 'default',
 	spec_json TEXT NOT NULL,
@@ -49,8 +49,32 @@ CREATE TABLE IF NOT EXISTS pods (
 	message TEXT NOT NULL DEFAULT '',
 	last_updated DATETIME NOT NULL,
 	created_at DATETIME NOT NULL
-);`)
-	return err
+);`,
+		`CREATE TABLE IF NOT EXISTS replicasets (
+	name TEXT PRIMARY KEY,
+	namespace TEXT NOT NULL DEFAULT 'default',
+	spec_json TEXT NOT NULL,
+	metadata_json TEXT NOT NULL,
+	status_json TEXT NOT NULL,
+	created_at DATETIME NOT NULL,
+	last_updated DATETIME NOT NULL
+);`,
+		`CREATE TABLE IF NOT EXISTS deployments (
+	name TEXT PRIMARY KEY,
+	namespace TEXT NOT NULL DEFAULT 'default',
+	spec_json TEXT NOT NULL,
+	metadata_json TEXT NOT NULL,
+	status_json TEXT NOT NULL,
+	created_at DATETIME NOT NULL,
+	last_updated DATETIME NOT NULL
+);`,
+	}
+	for _, s1 := range stmts {
+		if _, err := s.db.Exec(s1); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // CreatePod inserts a pod in Pending phase.
@@ -190,4 +214,183 @@ func nsOrDefault(ns string) string {
 		return "default"
 	}
 	return ns
+}
+
+// ---------------- ReplicaSet ----------------
+
+// UpsertReplicaSet inserts or updates an RS, preserving status on update.
+func (s *Store) UpsertReplicaSet(rs *api.ReplicaSet) error {
+	now := time.Now().UTC()
+	existing, err := s.GetReplicaSet(rs.Metadata.Name)
+	if err == nil {
+		rs.Status = existing.Status
+		specB, _ := json.Marshal(rs.Spec)
+		metaB, _ := json.Marshal(rs.Metadata)
+		statusB, _ := json.Marshal(rs.Status)
+		_, err := s.db.Exec(`UPDATE replicasets SET namespace=?, spec_json=?, metadata_json=?, status_json=?, last_updated=? WHERE name=?`,
+			nsOrDefault(rs.Metadata.Namespace), string(specB), string(metaB), string(statusB), now, rs.Metadata.Name)
+		return err
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return err
+	}
+	rs.Status.LastUpdated = now
+	specB, _ := json.Marshal(rs.Spec)
+	metaB, _ := json.Marshal(rs.Metadata)
+	statusB, _ := json.Marshal(rs.Status)
+	_, err = s.db.Exec(`INSERT INTO replicasets(name, namespace, spec_json, metadata_json, status_json, created_at, last_updated) VALUES(?,?,?,?,?,?,?)`,
+		rs.Metadata.Name, nsOrDefault(rs.Metadata.Namespace), string(specB), string(metaB), string(statusB), now, now)
+	return err
+}
+
+func (s *Store) GetReplicaSet(name string) (*api.ReplicaSet, error) {
+	row := s.db.QueryRow(`SELECT spec_json, metadata_json, status_json FROM replicasets WHERE name=?`, name)
+	var specJ, metaJ, statusJ string
+	if err := row.Scan(&specJ, &metaJ, &statusJ); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	rs := &api.ReplicaSet{APIVersion: "v1", Kind: "ReplicaSet"}
+	_ = json.Unmarshal([]byte(specJ), &rs.Spec)
+	_ = json.Unmarshal([]byte(metaJ), &rs.Metadata)
+	_ = json.Unmarshal([]byte(statusJ), &rs.Status)
+	return rs, nil
+}
+
+func (s *Store) ListReplicaSets() ([]*api.ReplicaSet, error) {
+	rows, err := s.db.Query(`SELECT spec_json, metadata_json, status_json FROM replicasets ORDER BY created_at ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*api.ReplicaSet
+	for rows.Next() {
+		var specJ, metaJ, statusJ string
+		if err := rows.Scan(&specJ, &metaJ, &statusJ); err != nil {
+			return nil, err
+		}
+		rs := &api.ReplicaSet{APIVersion: "v1", Kind: "ReplicaSet"}
+		_ = json.Unmarshal([]byte(specJ), &rs.Spec)
+		_ = json.Unmarshal([]byte(metaJ), &rs.Metadata)
+		_ = json.Unmarshal([]byte(statusJ), &rs.Status)
+		out = append(out, rs)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) UpdateReplicaSetStatus(name string, status api.ReplicaSetStatus) error {
+	status.LastUpdated = time.Now().UTC()
+	b, _ := json.Marshal(status)
+	res, err := s.db.Exec(`UPDATE replicasets SET status_json=?, last_updated=? WHERE name=?`, string(b), status.LastUpdated, name)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) DeleteReplicaSet(name string) error {
+	res, err := s.db.Exec(`DELETE FROM replicasets WHERE name=?`, name)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ---------------- Deployment ----------------
+
+func (s *Store) UpsertDeployment(d *api.Deployment) error {
+	now := time.Now().UTC()
+	existing, err := s.GetDeployment(d.Metadata.Name)
+	if err == nil {
+		d.Status = existing.Status
+		specB, _ := json.Marshal(d.Spec)
+		metaB, _ := json.Marshal(d.Metadata)
+		statusB, _ := json.Marshal(d.Status)
+		_, err := s.db.Exec(`UPDATE deployments SET namespace=?, spec_json=?, metadata_json=?, status_json=?, last_updated=? WHERE name=?`,
+			nsOrDefault(d.Metadata.Namespace), string(specB), string(metaB), string(statusB), now, d.Metadata.Name)
+		return err
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return err
+	}
+	d.Status.LastUpdated = now
+	specB, _ := json.Marshal(d.Spec)
+	metaB, _ := json.Marshal(d.Metadata)
+	statusB, _ := json.Marshal(d.Status)
+	_, err = s.db.Exec(`INSERT INTO deployments(name, namespace, spec_json, metadata_json, status_json, created_at, last_updated) VALUES(?,?,?,?,?,?,?)`,
+		d.Metadata.Name, nsOrDefault(d.Metadata.Namespace), string(specB), string(metaB), string(statusB), now, now)
+	return err
+}
+
+func (s *Store) GetDeployment(name string) (*api.Deployment, error) {
+	row := s.db.QueryRow(`SELECT spec_json, metadata_json, status_json FROM deployments WHERE name=?`, name)
+	var specJ, metaJ, statusJ string
+	if err := row.Scan(&specJ, &metaJ, &statusJ); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	d := &api.Deployment{APIVersion: "apps/v1", Kind: "Deployment"}
+	_ = json.Unmarshal([]byte(specJ), &d.Spec)
+	_ = json.Unmarshal([]byte(metaJ), &d.Metadata)
+	_ = json.Unmarshal([]byte(statusJ), &d.Status)
+	return d, nil
+}
+
+func (s *Store) ListDeployments() ([]*api.Deployment, error) {
+	rows, err := s.db.Query(`SELECT spec_json, metadata_json, status_json FROM deployments ORDER BY created_at ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*api.Deployment
+	for rows.Next() {
+		var specJ, metaJ, statusJ string
+		if err := rows.Scan(&specJ, &metaJ, &statusJ); err != nil {
+			return nil, err
+		}
+		d := &api.Deployment{APIVersion: "apps/v1", Kind: "Deployment"}
+		_ = json.Unmarshal([]byte(specJ), &d.Spec)
+		_ = json.Unmarshal([]byte(metaJ), &d.Metadata)
+		_ = json.Unmarshal([]byte(statusJ), &d.Status)
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) UpdateDeploymentStatus(name string, status api.DeploymentStatus) error {
+	status.LastUpdated = time.Now().UTC()
+	b, _ := json.Marshal(status)
+	res, err := s.db.Exec(`UPDATE deployments SET status_json=?, last_updated=? WHERE name=?`, string(b), status.LastUpdated, name)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) DeleteDeployment(name string) error {
+	res, err := s.db.Exec(`DELETE FROM deployments WHERE name=?`, name)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }

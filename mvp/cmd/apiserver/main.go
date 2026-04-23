@@ -37,6 +37,186 @@ func main() {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
 	})
+	mux.HandleFunc("/apis/apps/v1/replicasets", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			rss, err := st.ListReplicaSets()
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]interface{}{"items": rss})
+		case http.MethodPost:
+			var rs api.ReplicaSet
+			if err := json.NewDecoder(r.Body).Decode(&rs); err != nil {
+				http.Error(w, "invalid json: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			if rs.Metadata.Name == "" {
+				http.Error(w, "metadata.name required", http.StatusBadRequest)
+				return
+			}
+			rs.APIVersion = "apps/v1"
+			rs.Kind = "ReplicaSet"
+			if err := st.UpsertReplicaSet(&rs); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			out, _ := st.GetReplicaSet(rs.Metadata.Name)
+			writeJSON(w, http.StatusCreated, out)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+	mux.HandleFunc("/apis/apps/v1/replicasets/", func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimPrefix(r.URL.Path, "/apis/apps/v1/replicasets/")
+		if strings.HasSuffix(name, "/status") {
+			n := strings.TrimSuffix(name, "/status")
+			if r.Method == http.MethodPut || r.Method == http.MethodPatch {
+				var s api.ReplicaSetStatus
+				if err := json.NewDecoder(r.Body).Decode(&s); err != nil {
+					http.Error(w, "invalid json: "+err.Error(), http.StatusBadRequest)
+					return
+				}
+				if err := st.UpdateReplicaSetStatus(n, s); err != nil {
+					if errors.Is(err, store.ErrNotFound) {
+						http.Error(w, "not found", http.StatusNotFound)
+						return
+					}
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+				out, _ := st.GetReplicaSet(n)
+				writeJSON(w, http.StatusOK, out)
+				return
+			}
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if name == "" {
+			http.Error(w, "name required", http.StatusBadRequest)
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			rs, err := st.GetReplicaSet(name)
+			if err != nil {
+				if errors.Is(err, store.ErrNotFound) {
+					http.Error(w, "not found", http.StatusNotFound)
+					return
+				}
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			writeJSON(w, http.StatusOK, rs)
+		case http.MethodDelete:
+			if err := st.DeleteReplicaSet(name); err != nil {
+				if errors.Is(err, store.ErrNotFound) {
+					http.Error(w, "not found", http.StatusNotFound)
+					return
+				}
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]string{"status": "deleted", "name": name})
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+	mux.HandleFunc("/apis/apps/v1/deployments", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			ds, err := st.ListDeployments()
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]interface{}{"items": ds})
+		case http.MethodPost:
+			var d api.Deployment
+			if err := json.NewDecoder(r.Body).Decode(&d); err != nil {
+				http.Error(w, "invalid json: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			if d.Metadata.Name == "" {
+				http.Error(w, "metadata.name required", http.StatusBadRequest)
+				return
+			}
+			if d.Spec.Replicas < 0 {
+				http.Error(w, "spec.replicas must be >= 0", http.StatusBadRequest)
+				return
+			}
+			if len(d.Spec.Template.Spec.Containers) == 0 {
+				http.Error(w, "spec.template.spec.containers required", http.StatusBadRequest)
+				return
+			}
+			d.APIVersion = "apps/v1"
+			d.Kind = "Deployment"
+			if err := st.UpsertDeployment(&d); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			out, _ := st.GetDeployment(d.Metadata.Name)
+			writeJSON(w, http.StatusCreated, out)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+	mux.HandleFunc("/apis/apps/v1/deployments/", func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimPrefix(r.URL.Path, "/apis/apps/v1/deployments/")
+		if strings.HasSuffix(name, "/status") {
+			n := strings.TrimSuffix(name, "/status")
+			if r.Method == http.MethodPut || r.Method == http.MethodPatch {
+				var s api.DeploymentStatus
+				if err := json.NewDecoder(r.Body).Decode(&s); err != nil {
+					http.Error(w, "invalid json: "+err.Error(), http.StatusBadRequest)
+					return
+				}
+				if err := st.UpdateDeploymentStatus(n, s); err != nil {
+					if errors.Is(err, store.ErrNotFound) {
+						http.Error(w, "not found", http.StatusNotFound)
+						return
+					}
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+				out, _ := st.GetDeployment(n)
+				writeJSON(w, http.StatusOK, out)
+				return
+			}
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if name == "" {
+			http.Error(w, "name required", http.StatusBadRequest)
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			d, err := st.GetDeployment(name)
+			if err != nil {
+				if errors.Is(err, store.ErrNotFound) {
+					http.Error(w, "not found", http.StatusNotFound)
+					return
+				}
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			writeJSON(w, http.StatusOK, d)
+		case http.MethodDelete:
+			if err := st.DeleteDeployment(name); err != nil {
+				if errors.Is(err, store.ErrNotFound) {
+					http.Error(w, "not found", http.StatusNotFound)
+					return
+				}
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]string{"status": "deleted", "name": name})
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
 	mux.HandleFunc("/api/v1/pods/", func(w http.ResponseWriter, r *http.Request) {
 		name := strings.TrimPrefix(r.URL.Path, "/api/v1/pods/")
 		// Allow /api/v1/pods/{name}/status (PUT/PATCH)

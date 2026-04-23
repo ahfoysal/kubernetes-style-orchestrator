@@ -48,3 +48,58 @@ type Pod struct {
 	Spec       PodSpec   `json:"spec" yaml:"spec"`
 	Status     PodStatus `json:"status,omitempty" yaml:"status,omitempty"`
 }
+
+// PodTemplate is the template used by ReplicaSet / Deployment to create pods.
+type PodTemplate struct {
+	Metadata Metadata `json:"metadata,omitempty" yaml:"metadata,omitempty"`
+	Spec     PodSpec  `json:"spec" yaml:"spec"`
+}
+
+// ReplicaSetSpec describes desired state of a ReplicaSet.
+type ReplicaSetSpec struct {
+	Replicas int               `json:"replicas" yaml:"replicas"`
+	Selector map[string]string `json:"selector,omitempty" yaml:"selector,omitempty"`
+	Template PodTemplate       `json:"template" yaml:"template"`
+}
+
+// ReplicaSetStatus is observed state of a ReplicaSet.
+type ReplicaSetStatus struct {
+	Replicas      int       `json:"replicas" yaml:"replicas"`
+	ReadyReplicas int       `json:"readyReplicas" yaml:"readyReplicas"`
+	LastUpdated   time.Time `json:"lastUpdated" yaml:"lastUpdated"`
+}
+
+// ReplicaSet is a set of identical pods.
+type ReplicaSet struct {
+	APIVersion string           `json:"apiVersion,omitempty" yaml:"apiVersion,omitempty"`
+	Kind       string           `json:"kind,omitempty" yaml:"kind,omitempty"`
+	Metadata   Metadata         `json:"metadata" yaml:"metadata"`
+	Spec       ReplicaSetSpec   `json:"spec" yaml:"spec"`
+	Status     ReplicaSetStatus `json:"status,omitempty" yaml:"status,omitempty"`
+}
+
+// DeploymentSpec describes desired state of a Deployment.
+type DeploymentSpec struct {
+	Replicas int               `json:"replicas" yaml:"replicas"`
+	Selector map[string]string `json:"selector,omitempty" yaml:"selector,omitempty"`
+	Template PodTemplate       `json:"template" yaml:"template"`
+	// Strategy is a stub for M3 (RollingUpdate). Currently only "Recreate"
+	// semantics are actually implemented by the controller.
+	Strategy string `json:"strategy,omitempty" yaml:"strategy,omitempty"`
+}
+
+// DeploymentStatus is observed state.
+type DeploymentStatus struct {
+	Replicas      int       `json:"replicas" yaml:"replicas"`
+	ReadyReplicas int       `json:"readyReplicas" yaml:"readyReplicas"`
+	LastUpdated   time.Time `json:"lastUpdated" yaml:"lastUpdated"`
+}
+
+// Deployment declares desired replicas of a pod template.
+type Deployment struct {
+	APIVersion string           `json:"apiVersion,omitempty" yaml:"apiVersion,omitempty"`
+	Kind       string           `json:"kind,omitempty" yaml:"kind,omitempty"`
+	Metadata   Metadata         `json:"metadata" yaml:"metadata"`
+	Spec       DeploymentSpec   `json:"spec" yaml:"spec"`
+	Status     DeploymentStatus `json:"status,omitempty" yaml:"status,omitempty"`
+}

@@ -80,20 +80,113 @@ container ID.
 ```
 mvp/
   cmd/
-    apiserver/   # REST server + SQLite
-    scheduler/   # picks node-1, sets phase=Scheduled
-    kubelet/     # polls assigned pods, runs via docker or stub
-    mkctl/       # CLI (apply -f, get, describe, delete) — uses yaml.v3
+    apiserver/           # REST server + SQLite (Pods, ReplicaSets, Deployments)
+    scheduler/           # picks node-1, sets phase=Scheduled
+    kubelet/             # polls assigned pods, runs via docker or stub
+    controller-manager/  # runs RS + Deployment reconcilers (M2)
+    mkctl/               # CLI (apply -f, get, describe, delete) — uses yaml.v3
   internal/
-    api/         # Pod/Container/PodSpec/PodStatus types + phase constants
-    store/       # SQLite-backed Pod store (pure-Go driver)
-  examples/      # sample Pod YAMLs
+    api/                 # Pod/ReplicaSet/Deployment types + phase constants
+    store/               # SQLite-backed store (pure-Go driver)
+    client/              # HTTP client used by controllers + CLI
+    controllers/         # replicaset + deployment reconcilers (M2)
+  examples/              # sample Pod / Deployment YAMLs
+```
+
+## M2 Status — Reconciliation loops + ReplicaSet + Deployment (DONE)
+
+New in M2:
+
+- **`ReplicaSet` resource** (`apiVersion: apps/v1`, `kind: ReplicaSet`) with
+  `spec.replicas`, `spec.selector`, `spec.template`. REST at
+  `/apis/apps/v1/replicasets[/{name}[/status]]`.
+- **`Deployment` resource** (`apiVersion: apps/v1`, `kind: Deployment`) with
+  `spec.replicas` + `spec.template` and a stubbed `spec.strategy` field (real
+  rolling update lands in M3). REST at
+  `/apis/apps/v1/deployments[/{name}[/status]]`.
+- **`mk-controller-manager`** — runs both reconcilers in-process, each on its
+  own ticker (default 2s):
+  - **ReplicaSet controller** — lists RS + pods, counts pods carrying label
+    `mk.replicaset=<rsName>`, creates missing (`<rs>-<randhex5>`) or deletes
+    extras, writes observed replica counts to RS status.
+  - **Deployment controller** — creates/updates a single owned
+    ReplicaSet named `<deploy>-rs` and mirrors its status up to the
+    Deployment's status subresource.
+- **`mkctl`** — `apply -f` now auto-dispatches on `kind` (Pod / ReplicaSet
+  / Deployment); added `get replicasets`, `get deployments`, and
+  `delete rs|deploy <name>`.
+- **Example:** [`mvp/examples/deployment-hello.yaml`](./mvp/examples/deployment-hello.yaml)
+
+### Run the M2 demo (from `mvp/`)
+
+```bash
+mkdir -p data bin
+go build -o bin/mk-apiserver          ./cmd/apiserver
+go build -o bin/mk-scheduler          ./cmd/scheduler
+go build -o bin/mk-kubelet            ./cmd/kubelet
+go build -o bin/mk-controller-manager ./cmd/controller-manager
+go build -o bin/mkctl                 ./cmd/mkctl
+
+# 4 long-running processes:
+./bin/mk-apiserver          -addr :8080 -db data/mk.db
+./bin/mk-scheduler          -api http://127.0.0.1:8080 -node node-1 -interval 1s
+./bin/mk-kubelet            -api http://127.0.0.1:8080 -node node-1 -interval 1s -docker=false
+./bin/mk-controller-manager -api http://127.0.0.1:8080 -interval 1s
+
+./bin/mkctl apply -f examples/deployment-hello.yaml
+./bin/mkctl get deployments
+./bin/mkctl get rs
+./bin/mkctl get pods
+# kill one pod — controller recreates it
+./bin/mkctl delete pod <one-of-the-pod-names>
+./bin/mkctl get pods
+```
+
+### Demo output (captured)
+
+```
+$ mkctl apply -f examples/deployment-hello.yaml
+deployment/hello applied (replicas=3)
+
+$ mkctl get deployments
+NAME   DESIRED  CURRENT  READY  IMAGE        AGE
+hello  3        3        3      alpine:3.20  10s
+
+$ mkctl get rs
+NAME      DESIRED  CURRENT  READY  IMAGE        AGE
+hello-rs  3        3        3      alpine:3.20  0s
+
+$ mkctl get pods
+NAME            PHASE    NODE    IMAGE        AGE  MESSAGE
+hello-rs-ca396  Running  node-1  alpine:3.20  1s   started
+hello-rs-07e85  Running  node-1  alpine:3.20  1s   started
+hello-rs-855f9  Running  node-1  alpine:3.20  1s   started
+
+$ mkctl delete pod hello-rs-ca396
+pod/hello-rs-ca396 deleted
+
+$ mkctl get pods   # controller recreates the missing replica
+NAME            PHASE    NODE    IMAGE        AGE  MESSAGE
+hello-rs-07e85  Running  node-1  alpine:3.20  12s  started
+hello-rs-855f9  Running  node-1  alpine:3.20  12s  started
+hello-rs-d717d  Running  node-1  alpine:3.20  3s   started
+```
+
+Relevant `mk-controller-manager` log lines:
+
+```
+deployment-controller: deployment=hello created rs=hello-rs replicas=3
+replicaset-controller: rs=hello-rs created pod=hello-rs-ca396
+replicaset-controller: rs=hello-rs created pod=hello-rs-07e85
+replicaset-controller: rs=hello-rs created pod=hello-rs-855f9
+replicaset-controller: rs=hello-rs created pod=hello-rs-d717d   # self-healed after delete
 ```
 
 ## Milestones
 - **M1 (Week 1):** API server + SQLite store + Pod CRUD + YAML apply — DONE (MVP v0.1)
 - **M2 (Week 3):** Scheduler + node agent runs containers via containerd — scheduler DONE; kubelet runs via docker (containerd migration pending)
-- **M3 (Week 6):** Reconciliation loops + ReplicaSet + Deployment controllers
+- **M2 (controllers):** Reconciliation loops + ReplicaSet + Deployment controllers — DONE
+- **M3 (Week 6):** Rolling update strategy, revision history, horizontal pod autoscaler stub
 - **M4 (Week 9):** Services + kube-proxy-style networking + CoreDNS
 - **M5 (Week 12):** CRDs + operator SDK + multi-node + RBAC
 
