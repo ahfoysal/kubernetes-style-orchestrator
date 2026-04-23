@@ -182,12 +182,142 @@ replicaset-controller: rs=hello-rs created pod=hello-rs-855f9
 replicaset-controller: rs=hello-rs created pod=hello-rs-d717d   # self-healed after delete
 ```
 
+## M3 Status — Services + Endpoints + kube-proxy + DNS (DONE)
+
+M3 introduces cluster-internal service discovery and L4 load balancing,
+mirroring Kubernetes' `Service` / `Endpoints` + `kube-proxy` + `CoreDNS`
+stack.
+
+New in M3:
+
+- **`Service` resource** (`apiVersion: v1`, `kind: Service`) with
+  `spec.selector`, `spec.ports`, `spec.type` (`ClusterIP` only for M3),
+  `spec.clusterIP` (auto-allocated). REST at
+  `/api/v1/services[/{name}]`.
+- **`Endpoints` resource** maintained 1:1 with Services, listing live
+  pod IP:port tuples that match the selector. REST at
+  `/api/v1/endpoints[/{name}]`.
+- **`ServiceController`** (runs inside `mk-controller-manager`) — watches
+  Services + Pods on every tick; for each Service it rebuilds the
+  Endpoints object from Running pods whose labels match
+  `spec.selector`.
+- **`mk-kube-proxy`** — userspace L4 load balancer. Binds a TCP listener
+  on `ClusterIP:port` per Service and round-robins new connections
+  across the current endpoint set (atomic swap — no flapping when the
+  endpoints list changes).
+- **`mk-coredns-mini`** — embedded DNS server (`github.com/miekg/dns`)
+  that resolves `<service>.<namespace>.svc.cluster.local` and
+  `<service>.<namespace>.cluster.local` → ClusterIP. Listens on
+  `127.0.0.1:15353` by default (port 5353 is taken by `mDNSResponder`
+  on macOS).
+- **Stub runtime now serves HTTP** — `mk-kubelet -docker=false` starts
+  an in-process HTTP listener per pod on a random loopback port and
+  writes `PodIP` + `HostPort` into the Pod's status, so the proxy can
+  actually forward traffic without needing Docker. (A real container
+  runtime would publish a hostPort instead.)
+- **`mkctl` additions** — `apply -f` auto-dispatches `kind: Service`;
+  new `get services` / `get svc` and `get endpoints` / `get ep`;
+  `delete svc <name>`.
+- **Example:** [`mvp/examples/service-hello.yaml`](./mvp/examples/service-hello.yaml).
+
+### ClusterIP allocation (single-host MVP)
+
+The apiserver allocates a ClusterIP per Service. On a real cluster this
+would be a fresh `/32` from a reserved CIDR; here we run everything on
+loopback, so the default is `127.0.0.1` and each Service must pick a
+unique `spec.ports[].port`. Pass `-cluster-ip-loopback-cidr` to the
+apiserver to allocate out of `127.20.0.0/24` instead (requires
+`sudo ifconfig lo0 alias 127.20.0.X up` on macOS, or
+`sudo ip addr add 127.20.0.X/8 dev lo` on linux).
+
+### Run the M3 demo (from `mvp/`)
+
+```bash
+mkdir -p data bin
+go build -o bin/mk-apiserver          ./cmd/apiserver
+go build -o bin/mk-scheduler          ./cmd/scheduler
+go build -o bin/mk-kubelet            ./cmd/kubelet
+go build -o bin/mk-controller-manager ./cmd/controller-manager
+go build -o bin/mk-kube-proxy         ./cmd/kube-proxy
+go build -o bin/mk-coredns-mini       ./cmd/coredns-mini
+go build -o bin/mkctl                 ./cmd/mkctl
+
+# 6 long-running processes:
+./bin/mk-apiserver          -addr :8080 -db data/mk.db
+./bin/mk-scheduler          -api http://127.0.0.1:8080 -node node-1 -interval 500ms
+./bin/mk-kubelet            -api http://127.0.0.1:8080 -node node-1 -interval 500ms -docker=false
+./bin/mk-controller-manager -api http://127.0.0.1:8080 -interval 500ms
+./bin/mk-kube-proxy         -api http://127.0.0.1:8080 -interval 500ms
+./bin/mk-coredns-mini       -api http://127.0.0.1:8080 -listen 127.0.0.1:15353 -interval 500ms
+
+./bin/mkctl apply -f examples/deployment-hello.yaml
+./bin/mkctl apply -f examples/service-hello.yaml
+
+./bin/mkctl get svc
+./bin/mkctl get endpoints
+./bin/mkctl get pods
+
+# Hit the Service — kube-proxy round-robins across the 3 pods.
+for i in 1 2 3 4 5 6; do curl -s http://127.0.0.1:9090/; done
+
+# Resolve the service DNS name.
+dig @127.0.0.1 -p 15353 +short hello.default.svc.cluster.local
+```
+
+### Demo output (captured)
+
+```
+$ mkctl apply -f examples/deployment-hello.yaml
+deployment/hello applied (replicas=3)
+
+$ mkctl apply -f examples/service-hello.yaml
+service/hello applied (clusterIP=127.0.0.1)
+
+$ mkctl get svc
+NAME   TYPE       CLUSTER-IP  PORT(S)         SELECTOR   AGE
+hello  ClusterIP  127.0.0.1   9090->8080/TCP  app=hello  5s
+
+$ mkctl get endpoints
+NAME   ENDPOINTS                                        AGE
+hello  127.0.0.1:62192,127.0.0.1:62193,127.0.0.1:62195  0s
+
+$ for i in 1 2 3 4 5 6; do curl -s http://127.0.0.1:9090/; done
+hello from pod hello-rs-09cc4 (image=alpine:3.20 port=62192)
+hello from pod hello-rs-ffb0c (image=alpine:3.20 port=62193)
+hello from pod hello-rs-3443f (image=alpine:3.20 port=62195)
+hello from pod hello-rs-09cc4 (image=alpine:3.20 port=62192)
+hello from pod hello-rs-ffb0c (image=alpine:3.20 port=62193)
+hello from pod hello-rs-3443f (image=alpine:3.20 port=62195)
+
+$ dig @127.0.0.1 -p 15353 +short hello.default.svc.cluster.local
+127.0.0.1
+```
+
+Delete a pod and the ReplicaSet + ServiceController recreate the
+backend and update Endpoints; subsequent connections balance across
+the new set:
+
+```
+$ mkctl delete pod hello-rs-09cc4
+pod/hello-rs-09cc4 deleted
+
+$ mkctl get endpoints
+NAME   ENDPOINTS                                        AGE
+hello  127.0.0.1:54645,127.0.0.1:62193,127.0.0.1:62195  0s
+
+$ for i in 1 2 3 4; do curl -s http://127.0.0.1:9090/; done
+hello from pod hello-rs-8cccf (image=alpine:3.20 port=54645)
+hello from pod hello-rs-ffb0c (image=alpine:3.20 port=62193)
+hello from pod hello-rs-3443f (image=alpine:3.20 port=62195)
+hello from pod hello-rs-8cccf (image=alpine:3.20 port=54645)
+```
+
 ## Milestones
 - **M1 (Week 1):** API server + SQLite store + Pod CRUD + YAML apply — DONE (MVP v0.1)
 - **M2 (Week 3):** Scheduler + node agent runs containers via containerd — scheduler DONE; kubelet runs via docker (containerd migration pending)
 - **M2 (controllers):** Reconciliation loops + ReplicaSet + Deployment controllers — DONE
-- **M3 (Week 6):** Rolling update strategy, revision history, horizontal pod autoscaler stub
-- **M4 (Week 9):** Services + kube-proxy-style networking + CoreDNS
+- **M3 (Week 6):** Services + Endpoints + kube-proxy-style L4 LB + embedded DNS — DONE
+- **M4:** Rolling update strategy, revision history, horizontal pod autoscaler stub
 - **M5 (Week 12):** CRDs + operator SDK + multi-node + RBAC
 
 ## Key References

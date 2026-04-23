@@ -101,9 +101,28 @@ func applyCmd(server string, args []string) {
 		applyReplicaSet(server, data)
 	case "Deployment":
 		applyDeployment(server, data)
+	case "Service":
+		applyService(server, data)
 	default:
 		die("unsupported kind %q", peek.Kind)
 	}
+}
+
+func applyService(server string, data []byte) {
+	var s api.Service
+	if err := yaml.Unmarshal(data, &s); err != nil {
+		die("parse yaml: %v", err)
+	}
+	if s.Metadata.Name == "" {
+		die("metadata.name required")
+	}
+	body, _ := json.Marshal(s)
+	resp, err := http.Post(server+"/api/v1/services", "application/json", bytes.NewReader(body))
+	check(resp, err, "apply service")
+	defer resp.Body.Close()
+	var out api.Service
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	fmt.Printf("service/%s applied (clusterIP=%s)\n", out.Metadata.Name, out.Spec.ClusterIP)
 }
 
 func applyPod(server string, data []byte) {
@@ -171,9 +190,86 @@ func getCmd(server string, args []string) {
 		getReplicaSets(server)
 	case "deployments", "deploy", "deployment":
 		getDeployments(server)
+	case "services", "svc", "service":
+		getServices(server)
+	case "endpoints", "ep", "endpoint":
+		getEndpoints(server)
 	default:
 		die("unknown resource %q", args[0])
 	}
+}
+
+func getServices(server string) {
+	resp, err := http.Get(server + "/api/v1/services")
+	check(resp, err, "get services")
+	defer resp.Body.Close()
+	var list struct {
+		Items []*api.Service `json:"items"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		die("decode: %v", err)
+	}
+	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "NAME\tTYPE\tCLUSTER-IP\tPORT(S)\tSELECTOR\tAGE")
+	now := time.Now()
+	for _, s := range list.Items {
+		ports := ""
+		for i, p := range s.Spec.Ports {
+			if i > 0 {
+				ports += ","
+			}
+			tp := p.TargetPort
+			if tp == 0 {
+				tp = p.Port
+			}
+			proto := p.Protocol
+			if proto == "" {
+				proto = "TCP"
+			}
+			ports += fmt.Sprintf("%d->%d/%s", p.Port, tp, proto)
+		}
+		sel := ""
+		for k, v := range s.Spec.Selector {
+			if sel != "" {
+				sel += ","
+			}
+			sel += k + "=" + v
+		}
+		age := now.Sub(s.Status.LastUpdated).Truncate(time.Second).String()
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			s.Metadata.Name, nz(s.Spec.Type, "ClusterIP"), s.Spec.ClusterIP, ports, sel, age)
+	}
+	tw.Flush()
+}
+
+func getEndpoints(server string) {
+	resp, err := http.Get(server + "/api/v1/endpoints")
+	check(resp, err, "get endpoints")
+	defer resp.Body.Close()
+	var list struct {
+		Items []*api.Endpoints `json:"items"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		die("decode: %v", err)
+	}
+	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "NAME\tENDPOINTS\tAGE")
+	now := time.Now()
+	for _, e := range list.Items {
+		addrs := ""
+		for i, a := range e.Subsets {
+			if i > 0 {
+				addrs += ","
+			}
+			addrs += fmt.Sprintf("%s:%d", a.IP, a.Port)
+		}
+		if addrs == "" {
+			addrs = "<none>"
+		}
+		age := now.Sub(e.LastUpdated).Truncate(time.Second).String()
+		fmt.Fprintf(tw, "%s\t%s\t%s\n", e.Metadata.Name, addrs, age)
+	}
+	tw.Flush()
 }
 
 func getPods(server string) {
@@ -281,6 +377,8 @@ func deleteCmd(server string, args []string) {
 		path = "/apis/apps/v1/replicasets/" + name
 	case "deploy", "deployment", "deployments":
 		path = "/apis/apps/v1/deployments/" + name
+	case "svc", "service", "services":
+		path = "/api/v1/services/" + name
 	default:
 		die("unknown kind %q", kind)
 	}

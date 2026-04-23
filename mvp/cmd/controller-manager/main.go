@@ -24,9 +24,11 @@ func main() {
 
 	rc := controllers.NewReplicaSetController(c, *interval)
 	dc := controllers.NewDeploymentController(c, *interval)
+	sc := controllers.NewServiceController(c, *interval)
 
 	go rc.Run(stop)
 	go dc.Run(stop)
+	go sc.Run(stop)
 
 	log.Printf("mk-controller-manager: api=%s interval=%s", *apiAddr, *interval)
 

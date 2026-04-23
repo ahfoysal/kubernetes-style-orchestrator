@@ -7,13 +7,27 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ahfoysal/kubernetes-style-orchestrator/mvp/internal/api"
 )
+
+// stubServers tracks running in-process HTTP listeners for stub-run pods
+// so we can shut them down when a pod disappears from the apiserver.
+var (
+	stubMu      sync.Mutex
+	stubServers = map[string]*stubServer{}
+)
+
+type stubServer struct {
+	ln       net.Listener
+	shutdown func()
+}
 
 func main() {
 	apiAddr := flag.String("api", "http://127.0.0.1:8080", "apiserver base URL")
@@ -64,12 +78,24 @@ func syncOnce(apiAddr, node string, useDocker bool) error {
 	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
 		return err
 	}
+	seen := map[string]bool{}
 	for _, p := range list.Items {
+		seen[p.Metadata.Name] = true
 		switch p.Status.Phase {
 		case api.PhaseScheduled:
 			runPod(apiAddr, p, useDocker)
 		}
 	}
+	// Reap stub servers for pods that no longer exist.
+	stubMu.Lock()
+	for name, srv := range stubServers {
+		if !seen[name] {
+			srv.shutdown()
+			delete(stubServers, name)
+			log.Printf("pod=%s stub-runtime stopped (pod gone)", name)
+		}
+	}
+	stubMu.Unlock()
 	return nil
 }
 
@@ -80,11 +106,13 @@ func runPod(apiAddr string, p *api.Pod, useDocker bool) {
 	}
 	c := p.Spec.Containers[0]
 	containerID := ""
+	podIP := ""
+	hostPort := 0
 	var runErr error
 	if useDocker {
 		containerID, runErr = dockerRun(p.Metadata.Name, c)
 	} else {
-		containerID, runErr = stubRun(p.Metadata.Name, c)
+		containerID, podIP, hostPort, runErr = stubRun(p.Metadata.Name, c)
 	}
 	if runErr != nil {
 		patch(apiAddr, p.Metadata.Name, api.PodStatus{
@@ -97,8 +125,9 @@ func runPod(apiAddr string, p *api.Pod, useDocker bool) {
 	patch(apiAddr, p.Metadata.Name, api.PodStatus{
 		Phase: api.PhaseRunning, NodeName: p.Status.NodeName,
 		ContainerID: containerID, Message: "started",
+		PodIP: podIP, HostPort: hostPort,
 	})
-	log.Printf("pod=%s running (containerID=%s)", p.Metadata.Name, containerID)
+	log.Printf("pod=%s running (containerID=%s podIP=%s hostPort=%d)", p.Metadata.Name, containerID, podIP, hostPort)
 }
 
 func dockerRun(podName string, c api.Container) (string, error) {
@@ -123,14 +152,40 @@ func dockerRun(podName string, c api.Container) (string, error) {
 	return strings.TrimSpace(out.String()), nil
 }
 
-func stubRun(podName string, c api.Container) (string, error) {
-	// echo-based stub: just log what would have run
-	msg := fmt.Sprintf("[stub-run] pod=%s image=%s cmd=%v args=%v", podName, c.Image, c.Command, c.Args)
-	cmd := exec.Command("echo", msg)
-	if err := cmd.Run(); err != nil {
-		return "", err
+// stubRun starts an in-process HTTP server that responds with the pod
+// name. This lets the kube-proxy/DNS demo round-robin across distinct
+// "containers" without needing a real container runtime.
+func stubRun(podName string, c api.Container) (string, string, int, error) {
+	stubMu.Lock()
+	if existing, ok := stubServers[podName]; ok {
+		port := existing.ln.Addr().(*net.TCPAddr).Port
+		stubMu.Unlock()
+		return "stub-" + podName, "127.0.0.1", port, nil
 	}
-	return "stub-" + podName, nil
+	stubMu.Unlock()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return "", "", 0, fmt.Errorf("stub listen: %w", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "hello from pod %s (image=%s port=%d)\n", podName, c.Image, port)
+	})
+	srv := &http.Server{Handler: mux}
+	go func() { _ = srv.Serve(ln) }()
+
+	// Echo to console so the stub runtime stays visibly "alive".
+	_ = exec.Command("echo", fmt.Sprintf("[stub-run] pod=%s image=%s listening=127.0.0.1:%d", podName, c.Image, port)).Run()
+
+	stubMu.Lock()
+	stubServers[podName] = &stubServer{
+		ln:       ln,
+		shutdown: func() { _ = srv.Close() },
+	}
+	stubMu.Unlock()
+	return "stub-" + podName, "127.0.0.1", port, nil
 }
 
 func patch(apiAddr, name string, s api.PodStatus) {

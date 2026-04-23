@@ -142,3 +142,59 @@ func (c *Client) UpdateDeploymentStatus(name string, s api.DeploymentStatus) err
 func (c *Client) DeleteDeployment(name string) error {
 	return c.do(http.MethodDelete, "/apis/apps/v1/deployments/"+name, nil, nil)
 }
+
+// ---------- Services ----------
+
+func (c *Client) ListServices() ([]*api.Service, error) {
+	var out struct {
+		Items []*api.Service `json:"items"`
+	}
+	if err := c.do(http.MethodGet, "/api/v1/services", nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Items, nil
+}
+
+func (c *Client) GetService(name string) (*api.Service, error) {
+	var out api.Service
+	if err := c.do(http.MethodGet, "/api/v1/services/"+name, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) CreateService(s *api.Service) (*api.Service, error) {
+	var out api.Service
+	if err := c.do(http.MethodPost, "/api/v1/services", s, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) DeleteService(name string) error {
+	return c.do(http.MethodDelete, "/api/v1/services/"+name, nil, nil)
+}
+
+// ---------- Endpoints ----------
+
+func (c *Client) ListEndpoints() ([]*api.Endpoints, error) {
+	var out struct {
+		Items []*api.Endpoints `json:"items"`
+	}
+	if err := c.do(http.MethodGet, "/api/v1/endpoints", nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Items, nil
+}
+
+func (c *Client) GetEndpoints(name string) (*api.Endpoints, error) {
+	var out api.Endpoints
+	if err := c.do(http.MethodGet, "/api/v1/endpoints/"+name, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) UpsertEndpoints(ep *api.Endpoints) error {
+	return c.do(http.MethodPost, "/api/v1/endpoints", ep, nil)
+}
