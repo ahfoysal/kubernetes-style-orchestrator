@@ -1,0 +1,9 @@
+apiVersion: admission.mk.io/v1
+kind: AdmissionWebhook
+metadata:
+  name: add-label
+type: Mutating
+url: http://127.0.0.1:9443/mutate-add-label
+resources:
+  - "*"
+failurePolicy: Fail

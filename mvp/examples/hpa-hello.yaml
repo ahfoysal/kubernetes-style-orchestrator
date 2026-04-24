@@ -1,0 +1,14 @@
+apiVersion: autoscaling.mk.io/v1
+kind: HorizontalPodAutoscaler
+metadata:
+  name: hello
+spec:
+  scaleTargetRef:
+    kind: Deployment
+    name: hello
+  minReplicas: 2
+  maxReplicas: 10
+  metric:
+    type: Resource
+    name: cpu
+    targetAverageUtilization: 50

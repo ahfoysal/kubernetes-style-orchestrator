@@ -9,6 +9,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"sync/atomic"
+	"time"
 
 	"github.com/ahfoysal/kubernetes-style-orchestrator/mvp/internal/api"
 )
@@ -328,3 +331,115 @@ func (c *Client) CreateRoleBinding(b *api.RoleBinding) error {
 func (c *Client) CreateClusterRoleBinding(b *api.RoleBinding) error {
 	return c.do(http.MethodPost, "/apis/rbac.mk.io/v1/clusterrolebindings", b, nil)
 }
+
+// ---------- M5: Deployments get ----------
+
+func (c *Client) GetDeployment(name string) (*api.Deployment, error) {
+	var out api.Deployment
+	if err := c.do(http.MethodGet, "/apis/apps/v1/deployments/"+name, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ---------- M5: Admission Webhooks ----------
+
+func (c *Client) CreateWebhook(w *api.AdmissionWebhook) error {
+	return c.do(http.MethodPost, "/apis/admission.mk.io/v1/webhooks", w, nil)
+}
+
+func (c *Client) ListWebhooks() ([]*api.AdmissionWebhook, error) {
+	var out struct {
+		Items []*api.AdmissionWebhook `json:"items"`
+	}
+	if err := c.do(http.MethodGet, "/apis/admission.mk.io/v1/webhooks", nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Items, nil
+}
+
+func (c *Client) DeleteWebhook(name string) error {
+	return c.do(http.MethodDelete, "/apis/admission.mk.io/v1/webhooks/"+name, nil, nil)
+}
+
+// ---------- M5: HPA ----------
+
+func (c *Client) CreateHPA(h *api.HPA) (*api.HPA, error) {
+	var out api.HPA
+	if err := c.do(http.MethodPost, "/apis/autoscaling.mk.io/v1/horizontalpodautoscalers", h, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) ListHPAs() ([]*api.HPA, error) {
+	var out struct {
+		Items []*api.HPA `json:"items"`
+	}
+	if err := c.do(http.MethodGet, "/apis/autoscaling.mk.io/v1/horizontalpodautoscalers", nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Items, nil
+}
+
+func (c *Client) GetHPA(name string) (*api.HPA, error) {
+	var out api.HPA
+	if err := c.do(http.MethodGet, "/apis/autoscaling.mk.io/v1/horizontalpodautoscalers/"+name, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) UpdateHPAStatus(name string, st api.HPAStatus) error {
+	return c.do(http.MethodPut, "/apis/autoscaling.mk.io/v1/horizontalpodautoscalers/"+name+"/status", st, nil)
+}
+
+func (c *Client) DeleteHPA(name string) error {
+	return c.do(http.MethodDelete, "/apis/autoscaling.mk.io/v1/horizontalpodautoscalers/"+name, nil, nil)
+}
+
+// ---------- M5: Round-robin client-side load balancer ----------
+
+// NewLB returns a Client that round-robins requests across multiple
+// apiserver replicas. Its http.Client uses a custom RoundTripper that
+// rewrites req.URL.Host to the next base on every call, so every Client
+// method call lands on a different replica. If a replica returns a
+// transport error, the caller sees it — retry is up to the caller.
+//
+// Passing a single base is equivalent to New(bases[0]).
+func NewLB(bases []string) *Client {
+	if len(bases) == 0 {
+		return New("http://127.0.0.1:8080")
+	}
+	if len(bases) == 1 {
+		return New(bases[0])
+	}
+	idx := new(uint64)
+	tr := &rrTransport{bases: bases, idx: idx, next: http.DefaultTransport}
+	return &Client{
+		Base: bases[0],
+		HTTP: &http.Client{Transport: tr, Timeout: 10 * time.Second},
+	}
+}
+
+// rrTransport rewrites every outgoing request's scheme/host to the next
+// base in round-robin order. Used by NewLB.
+type rrTransport struct {
+	bases []string
+	idx   *uint64
+	next  http.RoundTripper
+}
+
+func (t *rrTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	n := atomic.AddUint64(t.idx, 1)
+	base := t.bases[int(n-1)%len(t.bases)]
+	u, err := url.Parse(base)
+	if err != nil {
+		return nil, err
+	}
+	req.URL.Scheme = u.Scheme
+	req.URL.Host = u.Host
+	req.Host = u.Host
+	return t.next.RoundTrip(req)
+}
+

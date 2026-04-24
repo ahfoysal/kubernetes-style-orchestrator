@@ -145,6 +145,33 @@ func (s *Store) migrate() error {
 	created_at DATETIME NOT NULL,
 	PRIMARY KEY (scope, name)
 );`,
+		// M5: leader election lease. One row per lease name; holder wins
+		// while renew_time is within the TTL.
+		`CREATE TABLE IF NOT EXISTS leases (
+	name TEXT PRIMARY KEY,
+	holder TEXT NOT NULL,
+	renew_time DATETIME NOT NULL,
+	ttl_seconds INTEGER NOT NULL
+);`,
+		// M5: admission webhook registry.
+		`CREATE TABLE IF NOT EXISTS admission_webhooks (
+	name TEXT PRIMARY KEY,
+	type TEXT NOT NULL,
+	url TEXT NOT NULL,
+	resources_json TEXT NOT NULL,
+	failure_policy TEXT NOT NULL DEFAULT 'Fail',
+	created_at DATETIME NOT NULL
+);`,
+		// M5: HPA registry.
+		`CREATE TABLE IF NOT EXISTS hpas (
+	name TEXT PRIMARY KEY,
+	namespace TEXT NOT NULL DEFAULT 'default',
+	spec_json TEXT NOT NULL,
+	metadata_json TEXT NOT NULL,
+	status_json TEXT NOT NULL,
+	created_at DATETIME NOT NULL,
+	last_updated DATETIME NOT NULL
+);`,
 	}
 	for _, s1 := range stmts {
 		if _, err := s.db.Exec(s1); err != nil {
@@ -958,6 +985,196 @@ func (s *Store) ListRoleBindings(scope string) ([]*api.RoleBinding, error) {
 
 func (s *Store) DeleteRoleBinding(scope, name string) error {
 	res, err := s.db.Exec(`DELETE FROM role_bindings WHERE scope=? AND name=?`, scope, name)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ---------------- M5: Leases (leader election) ----------------
+
+// TryAcquireLease attempts to become the holder of the given lease. It
+// succeeds if the lease does not exist, is already held by this identity,
+// or has expired (renew_time older than ttl). Returns (true, currentHolder)
+// on success, (false, currentHolder) otherwise.
+func (s *Store) TryAcquireLease(name, identity string, ttl time.Duration) (bool, string, error) {
+	now := time.Now().UTC()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, "", err
+	}
+	defer tx.Rollback()
+	var holder string
+	var renew time.Time
+	var ttlSec int
+	row := tx.QueryRow(`SELECT holder, renew_time, ttl_seconds FROM leases WHERE name=?`, name)
+	err = row.Scan(&holder, &renew, &ttlSec)
+	if errors.Is(err, sql.ErrNoRows) {
+		if _, err := tx.Exec(`INSERT INTO leases(name, holder, renew_time, ttl_seconds) VALUES(?,?,?,?)`,
+			name, identity, now, int(ttl.Seconds())); err != nil {
+			return false, "", err
+		}
+		if err := tx.Commit(); err != nil {
+			return false, "", err
+		}
+		return true, identity, nil
+	}
+	if err != nil {
+		return false, "", err
+	}
+	expired := now.Sub(renew) > time.Duration(ttlSec)*time.Second
+	if holder == identity || expired {
+		if _, err := tx.Exec(`UPDATE leases SET holder=?, renew_time=?, ttl_seconds=? WHERE name=?`,
+			identity, now, int(ttl.Seconds()), name); err != nil {
+			return false, "", err
+		}
+		if err := tx.Commit(); err != nil {
+			return false, "", err
+		}
+		return true, identity, nil
+	}
+	return false, holder, nil
+}
+
+// GetLease returns the current holder + renew time, for observability.
+func (s *Store) GetLease(name string) (string, time.Time, int, error) {
+	row := s.db.QueryRow(`SELECT holder, renew_time, ttl_seconds FROM leases WHERE name=?`, name)
+	var holder string
+	var renew time.Time
+	var ttl int
+	if err := row.Scan(&holder, &renew, &ttl); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", time.Time{}, 0, ErrNotFound
+		}
+		return "", time.Time{}, 0, err
+	}
+	return holder, renew, ttl, nil
+}
+
+// ---------------- M5: Admission Webhooks ----------------
+
+func (s *Store) UpsertWebhook(w *api.AdmissionWebhook) error {
+	if w.FailurePolicy == "" {
+		w.FailurePolicy = "Fail"
+	}
+	resB, _ := json.Marshal(w.Resources)
+	_, err := s.db.Exec(`INSERT INTO admission_webhooks(name, type, url, resources_json, failure_policy, created_at)
+		VALUES(?,?,?,?,?,?)
+		ON CONFLICT(name) DO UPDATE SET type=excluded.type, url=excluded.url, resources_json=excluded.resources_json, failure_policy=excluded.failure_policy`,
+		w.Metadata.Name, w.Type, w.URL, string(resB), w.FailurePolicy, time.Now().UTC())
+	return err
+}
+
+func (s *Store) ListWebhooks() ([]*api.AdmissionWebhook, error) {
+	rows, err := s.db.Query(`SELECT name, type, url, resources_json, failure_policy FROM admission_webhooks ORDER BY created_at ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*api.AdmissionWebhook
+	for rows.Next() {
+		var name, typ, url, resJ, fp string
+		if err := rows.Scan(&name, &typ, &url, &resJ, &fp); err != nil {
+			return nil, err
+		}
+		w := &api.AdmissionWebhook{APIVersion: "admission.mk.io/v1", Kind: "AdmissionWebhook"}
+		w.Metadata.Name = name
+		w.Type = typ
+		w.URL = url
+		w.FailurePolicy = fp
+		_ = json.Unmarshal([]byte(resJ), &w.Resources)
+		out = append(out, w)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) DeleteWebhook(name string) error {
+	res, err := s.db.Exec(`DELETE FROM admission_webhooks WHERE name=?`, name)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ---------------- M5: HPA ----------------
+
+func (s *Store) UpsertHPA(h *api.HPA) error {
+	now := time.Now().UTC()
+	existing, err := s.GetHPA(h.Metadata.Name)
+	if err == nil {
+		h.Status = existing.Status
+	}
+	specB, _ := json.Marshal(h.Spec)
+	metaB, _ := json.Marshal(h.Metadata)
+	statusB, _ := json.Marshal(h.Status)
+	_, err = s.db.Exec(`INSERT INTO hpas(name, namespace, spec_json, metadata_json, status_json, created_at, last_updated)
+		VALUES(?,?,?,?,?,?,?)
+		ON CONFLICT(name) DO UPDATE SET namespace=excluded.namespace, spec_json=excluded.spec_json, metadata_json=excluded.metadata_json, status_json=excluded.status_json, last_updated=excluded.last_updated`,
+		h.Metadata.Name, nsOrDefault(h.Metadata.Namespace), string(specB), string(metaB), string(statusB), now, now)
+	return err
+}
+
+func (s *Store) GetHPA(name string) (*api.HPA, error) {
+	row := s.db.QueryRow(`SELECT spec_json, metadata_json, status_json FROM hpas WHERE name=?`, name)
+	var specJ, metaJ, statusJ string
+	if err := row.Scan(&specJ, &metaJ, &statusJ); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	h := &api.HPA{APIVersion: "autoscaling.mk.io/v1", Kind: "HorizontalPodAutoscaler"}
+	_ = json.Unmarshal([]byte(specJ), &h.Spec)
+	_ = json.Unmarshal([]byte(metaJ), &h.Metadata)
+	_ = json.Unmarshal([]byte(statusJ), &h.Status)
+	return h, nil
+}
+
+func (s *Store) ListHPAs() ([]*api.HPA, error) {
+	rows, err := s.db.Query(`SELECT spec_json, metadata_json, status_json FROM hpas ORDER BY created_at ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*api.HPA
+	for rows.Next() {
+		var specJ, metaJ, statusJ string
+		if err := rows.Scan(&specJ, &metaJ, &statusJ); err != nil {
+			return nil, err
+		}
+		h := &api.HPA{APIVersion: "autoscaling.mk.io/v1", Kind: "HorizontalPodAutoscaler"}
+		_ = json.Unmarshal([]byte(specJ), &h.Spec)
+		_ = json.Unmarshal([]byte(metaJ), &h.Metadata)
+		_ = json.Unmarshal([]byte(statusJ), &h.Status)
+		out = append(out, h)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) UpdateHPAStatus(name string, st api.HPAStatus) error {
+	st.LastUpdated = time.Now().UTC()
+	b, _ := json.Marshal(st)
+	res, err := s.db.Exec(`UPDATE hpas SET status_json=?, last_updated=? WHERE name=?`, string(b), st.LastUpdated, name)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) DeleteHPA(name string) error {
+	res, err := s.db.Exec(`DELETE FROM hpas WHERE name=?`, name)
 	if err != nil {
 		return err
 	}

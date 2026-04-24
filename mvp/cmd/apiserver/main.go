@@ -1,17 +1,25 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/ahfoysal/kubernetes-style-orchestrator/mvp/internal/admission"
 	"github.com/ahfoysal/kubernetes-style-orchestrator/mvp/internal/api"
+	"github.com/ahfoysal/kubernetes-style-orchestrator/mvp/internal/client"
+	"github.com/ahfoysal/kubernetes-style-orchestrator/mvp/internal/controllers"
 	"github.com/ahfoysal/kubernetes-style-orchestrator/mvp/internal/crd"
+	"github.com/ahfoysal/kubernetes-style-orchestrator/mvp/internal/hpa"
 	"github.com/ahfoysal/kubernetes-style-orchestrator/mvp/internal/rbac"
 	"github.com/ahfoysal/kubernetes-style-orchestrator/mvp/internal/store"
 )
@@ -46,14 +54,17 @@ var _ = fmt.Sprintf
 
 // server bundles apiserver state so handlers can share it.
 type server struct {
-	st    *store.Store
-	alloc *clusterIPAlloc
-	auth  *rbac.Authenticator
-	authz *rbac.Authorizer
+	st        *store.Store
+	alloc     *clusterIPAlloc
+	auth      *rbac.Authenticator
+	authz     *rbac.Authorizer
+	admission *admission.Pipeline
 	// rbacEnforce toggles whether denials actually block requests. When
 	// false (default), RBAC decisions are logged but not enforced — lets
 	// the M1–M3 demos keep running without tokens.
 	rbacEnforce bool
+	// identity is this apiserver replica's identity (for lease election).
+	identity string
 }
 
 func main() {
@@ -61,7 +72,22 @@ func main() {
 	dbPath := flag.String("db", "data/mk.db", "sqlite db path")
 	loopCIDR := flag.Bool("cluster-ip-loopback-cidr", false, "allocate cluster IPs out of 127.20.0.0/24 instead of 127.0.0.1 (requires lo aliases)")
 	rbacEnforce := flag.Bool("rbac", false, "enforce RBAC (deny requests that lack permissions)")
+	// M5: HA. When two apiservers share the same DB, the one that holds
+	// the controller-manager lease runs the RS/Deployment/Service/HPA
+	// reconcilers; the other is hot-standby.
+	runControllers := flag.Bool("run-controllers", true, "contend for the controller-manager lease and run reconcilers when leader")
+	leaseName := flag.String("lease-name", "controller-manager", "lease key to contend for leadership")
+	leaseTTL := flag.Duration("lease-ttl", 10*time.Second, "lease TTL (must be > renew interval)")
+	leaseRenew := flag.Duration("lease-renew", 3*time.Second, "lease renewal interval")
+	identity := flag.String("identity", "", "this apiserver's unique identity (default: hostname+addr)")
+	metricsURL := flag.String("metrics-url", "http://127.0.0.1:9100", "metrics-server base URL (for HPA)")
+	apiSelf := flag.String("api-self", "", "this apiserver's reachable URL used by in-process controllers (default: http://127.0.0.1<addr>)")
 	flag.Parse()
+
+	if *identity == "" {
+		host, _ := os.Hostname()
+		*identity = host + *addr
+	}
 
 	st, err := store.Open(*dbPath)
 	if err != nil {
@@ -74,7 +100,9 @@ func main() {
 		alloc:       &clusterIPAlloc{next: 1, useLoop: *loopCIDR},
 		auth:        &rbac.Authenticator{Store: st, AnonymousAllowed: true},
 		authz:       &rbac.Authorizer{Store: st},
+		admission:   admission.New(st),
 		rbacEnforce: *rbacEnforce,
+		identity:    *identity,
 	}
 
 	mux := http.NewServeMux()
@@ -108,13 +136,246 @@ func main() {
 	mux.HandleFunc("/apis/rbac.mk.io/v1/rolebindings", s.guard("rbac.mk.io", "rolebindings", s.handleRoleBindings("RoleBinding")))
 	mux.HandleFunc("/apis/rbac.mk.io/v1/clusterrolebindings", s.guard("rbac.mk.io", "clusterrolebindings", s.handleRoleBindings("ClusterRoleBinding")))
 
+	// M5: Admission webhooks registry.
+	mux.HandleFunc("/apis/admission.mk.io/v1/webhooks", s.guard("admission.mk.io", "webhooks", s.handleWebhooks))
+	mux.HandleFunc("/apis/admission.mk.io/v1/webhooks/", s.guard("admission.mk.io", "webhooks", s.handleWebhooksByName))
+
+	// M5: HPA.
+	mux.HandleFunc("/apis/autoscaling.mk.io/v1/horizontalpodautoscalers", s.guard("autoscaling.mk.io", "horizontalpodautoscalers", s.handleHPAs))
+	mux.HandleFunc("/apis/autoscaling.mk.io/v1/horizontalpodautoscalers/", s.guard("autoscaling.mk.io", "horizontalpodautoscalers", s.handleHPAsByName))
+
+	// M5: observability — show who holds the controller-manager lease.
+	mux.HandleFunc("/apis/coordination.mk.io/v1/leases/", s.handleLease)
+
 	// Catch-all for dynamic CR paths: /apis/{group}/{version}/{plural}[/{name}]
 	// Routes that matched a static handler above won't reach this.
 	mux.HandleFunc("/apis/", s.handleDynamicCR)
 
-	log.Printf("mk-apiserver listening on %s (db=%s rbac=%v)", *addr, *dbPath, *rbacEnforce)
+	// Start leader election + in-process controllers if requested.
+	if *runControllers {
+		if *apiSelf == "" {
+			*apiSelf = "http://127.0.0.1" + *addr
+		}
+		go s.runLeaderElected(*leaseName, *leaseTTL, *leaseRenew, *apiSelf, *metricsURL)
+	}
+
+	log.Printf("mk-apiserver listening on %s (db=%s rbac=%v identity=%s)", *addr, *dbPath, *rbacEnforce, *identity)
 	if err := http.ListenAndServe(*addr, mux); err != nil {
 		log.Fatal(err)
+	}
+}
+
+// runLeaderElected contends for the given lease; while leader, runs the
+// ReplicaSet/Deployment/Service/HPA controllers in-process against
+// apiSelf. Loses leadership => stops controllers; regains => restarts.
+func (s *server) runLeaderElected(leaseName string, ttl, renew time.Duration, apiSelf, metricsURL string) {
+	var (
+		leading    bool
+		cancelCtrl context.CancelFunc
+	)
+	ticker := time.NewTicker(renew)
+	defer ticker.Stop()
+	for range ticker.C {
+		ok, holder, err := s.st.TryAcquireLease(leaseName, s.identity, ttl)
+		if err != nil {
+			log.Printf("lease: acquire error: %v", err)
+			continue
+		}
+		if ok && !leading {
+			log.Printf("lease: %s acquired by %s — starting controllers", leaseName, s.identity)
+			leading = true
+			ctx, cancel := context.WithCancel(context.Background())
+			cancelCtrl = cancel
+			go s.startControllers(ctx, apiSelf, metricsURL)
+		} else if !ok && leading {
+			log.Printf("lease: lost to %s — stopping controllers", holder)
+			leading = false
+			if cancelCtrl != nil {
+				cancelCtrl()
+			}
+		} else if !ok {
+			log.Printf("lease: standby (leader=%s)", holder)
+		}
+	}
+}
+
+func (s *server) startControllers(ctx context.Context, apiSelf, metricsURL string) {
+	c := client.New(apiSelf)
+	rc := controllers.NewReplicaSetController(c, 1*time.Second)
+	dc := controllers.NewDeploymentController(c, 1*time.Second)
+	sc := controllers.NewServiceController(c, 1*time.Second)
+	hc := hpa.New(c, metricsURL, 2*time.Second)
+
+	stop := make(chan struct{})
+	go rc.Run(stop)
+	go dc.Run(stop)
+	go sc.Run(stop)
+	go hc.Run(stop)
+
+	<-ctx.Done()
+	close(stop)
+}
+
+// handleLease returns the current holder of a lease (observability).
+func (s *server) handleLease(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimPrefix(r.URL.Path, "/apis/coordination.mk.io/v1/leases/")
+	if name == "" {
+		http.Error(w, "lease name required", http.StatusBadRequest)
+		return
+	}
+	holder, renew, ttl, err := s.st.GetLease(name)
+	if err != nil {
+		notFoundOrErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"name":          name,
+		"holder":        holder,
+		"renewTime":     renew,
+		"ttlSeconds":    ttl,
+		"expiresIn":     time.Duration(ttl)*time.Second - time.Since(renew),
+		"thisReplica":   s.identity,
+		"isThisReplica": holder == s.identity,
+	})
+}
+
+// ---------- M5: Admission Webhooks ----------
+
+func (s *server) handleWebhooks(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		hs, err := s.st.ListWebhooks()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"items": hs})
+	case http.MethodPost:
+		var h api.AdmissionWebhook
+		if err := json.NewDecoder(r.Body).Decode(&h); err != nil {
+			http.Error(w, "invalid json: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if h.Metadata.Name == "" || h.URL == "" || h.Type == "" {
+			http.Error(w, "metadata.name, url, type required", http.StatusBadRequest)
+			return
+		}
+		if h.Type != api.WebhookTypeMutating && h.Type != api.WebhookTypeValidating {
+			http.Error(w, "type must be Mutating or Validating", http.StatusBadRequest)
+			return
+		}
+		h.APIVersion = "admission.mk.io/v1"
+		h.Kind = "AdmissionWebhook"
+		if err := s.st.UpsertWebhook(&h); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		log.Printf("admission: registered webhook name=%s type=%s resources=%v url=%s", h.Metadata.Name, h.Type, h.Resources, h.URL)
+		writeJSON(w, http.StatusCreated, h)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *server) handleWebhooksByName(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimPrefix(r.URL.Path, "/apis/admission.mk.io/v1/webhooks/")
+	if name == "" {
+		http.Error(w, "name required", http.StatusBadRequest)
+		return
+	}
+	if r.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := s.st.DeleteWebhook(name); err != nil {
+		notFoundOrErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted", "name": name})
+}
+
+// ---------- M5: HPA ----------
+
+func (s *server) handleHPAs(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		hs, err := s.st.ListHPAs()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"items": hs})
+	case http.MethodPost:
+		var h api.HPA
+		if err := json.NewDecoder(r.Body).Decode(&h); err != nil {
+			http.Error(w, "invalid json: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if h.Metadata.Name == "" || h.Spec.ScaleTargetRef.Name == "" {
+			http.Error(w, "metadata.name and spec.scaleTargetRef.name required", http.StatusBadRequest)
+			return
+		}
+		if h.Spec.MinReplicas <= 0 {
+			h.Spec.MinReplicas = 1
+		}
+		if h.Spec.MaxReplicas < h.Spec.MinReplicas {
+			http.Error(w, "maxReplicas must be >= minReplicas", http.StatusBadRequest)
+			return
+		}
+		h.APIVersion = "autoscaling.mk.io/v1"
+		h.Kind = "HorizontalPodAutoscaler"
+		if err := s.st.UpsertHPA(&h); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		out, _ := s.st.GetHPA(h.Metadata.Name)
+		writeJSON(w, http.StatusCreated, out)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *server) handleHPAsByName(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimPrefix(r.URL.Path, "/apis/autoscaling.mk.io/v1/horizontalpodautoscalers/")
+	if strings.HasSuffix(name, "/status") {
+		n := strings.TrimSuffix(name, "/status")
+		if r.Method == http.MethodPut || r.Method == http.MethodPatch {
+			var st api.HPAStatus
+			if err := json.NewDecoder(r.Body).Decode(&st); err != nil {
+				http.Error(w, "invalid json: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			if err := s.st.UpdateHPAStatus(n, st); err != nil {
+				notFoundOrErr(w, err)
+				return
+			}
+			out, _ := s.st.GetHPA(n)
+			writeJSON(w, http.StatusOK, out)
+			return
+		}
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if name == "" {
+		http.Error(w, "name required", http.StatusBadRequest)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		h, err := s.st.GetHPA(name)
+		if err != nil {
+			notFoundOrErr(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, h)
+	case http.MethodDelete:
+		if err := s.st.DeleteHPA(name); err != nil {
+			notFoundOrErr(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted", "name": name})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
@@ -172,7 +433,7 @@ func (s *server) handlePods(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		listPods(w, r, s.st)
 	case http.MethodPost:
-		createPod(w, r, s.st)
+		s.createPod(w, r)
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
@@ -479,8 +740,13 @@ func (s *server) handleDeployments(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, map[string]interface{}{"items": ds})
 	case http.MethodPost:
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
+			return
+		}
 		var d api.Deployment
-		if err := json.NewDecoder(r.Body).Decode(&d); err != nil {
+		if err := json.Unmarshal(raw, &d); err != nil {
 			http.Error(w, "invalid json: "+err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -498,6 +764,17 @@ func (s *server) handleDeployments(w http.ResponseWriter, r *http.Request) {
 		}
 		d.APIVersion = "apps/v1"
 		d.Kind = "Deployment"
+		// Admission: let webhooks mutate/validate the deployment.
+		norm, _ := json.Marshal(d)
+		mutated, aerr := s.admission.Review("deployments", "Deployment", "CREATE", d.Metadata.Name, d.Metadata.Namespace, norm)
+		if aerr != nil {
+			http.Error(w, aerr.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := json.Unmarshal(mutated, &d); err != nil {
+			http.Error(w, "admission produced invalid object: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
 		if err := s.st.UpsertDeployment(&d); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -856,9 +1133,14 @@ func listPods(w http.ResponseWriter, r *http.Request, st *store.Store) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{"items": pods})
 }
 
-func createPod(w http.ResponseWriter, r *http.Request, st *store.Store) {
+func (s *server) createPod(w http.ResponseWriter, r *http.Request) {
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
 	var p api.Pod
-	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+	if err := json.Unmarshal(raw, &p); err != nil {
 		http.Error(w, "invalid json: "+err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -872,11 +1154,23 @@ func createPod(w http.ResponseWriter, r *http.Request, st *store.Store) {
 	}
 	p.APIVersion = "v1"
 	p.Kind = "Pod"
-	if err := st.UpsertPod(&p); err != nil {
+	// Admission: serialize + let the pipeline mutate/validate.
+	norm, _ := json.Marshal(p)
+	mutated, aerr := s.admission.Review("pods", "Pod", "CREATE", p.Metadata.Name, p.Metadata.Namespace, norm)
+	if aerr != nil {
+		http.Error(w, aerr.Error(), http.StatusBadRequest)
+		return
+	}
+	var finalPod api.Pod
+	if err := json.Unmarshal(mutated, &finalPod); err != nil {
+		http.Error(w, "admission produced invalid object: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := s.st.UpsertPod(&finalPod); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	out, _ := st.GetPod(p.Metadata.Name)
+	out, _ := s.st.GetPod(finalPod.Metadata.Name)
 	writeJSON(w, http.StatusCreated, out)
 }
 

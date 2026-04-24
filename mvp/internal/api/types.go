@@ -1,6 +1,9 @@
 package api
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // Phase represents the Pod lifecycle phase.
 const (
@@ -18,13 +21,24 @@ type ContainerPort struct {
 	Protocol      string `json:"protocol,omitempty" yaml:"protocol,omitempty"` // TCP (default)
 }
 
+// ResourceList describes resource requests/limits. Values are free-form
+// strings (e.g. "100m", "256Mi") — admission webhooks check presence only.
+type ResourceList map[string]string
+
+// ResourceRequirements is the {requests,limits} block on a container.
+type ResourceRequirements struct {
+	Requests ResourceList `json:"requests,omitempty" yaml:"requests,omitempty"`
+	Limits   ResourceList `json:"limits,omitempty" yaml:"limits,omitempty"`
+}
+
 // Container is a minimal container spec.
 type Container struct {
-	Name    string          `json:"name" yaml:"name"`
-	Image   string          `json:"image" yaml:"image"`
-	Command []string        `json:"command,omitempty" yaml:"command,omitempty"`
-	Args    []string        `json:"args,omitempty" yaml:"args,omitempty"`
-	Ports   []ContainerPort `json:"ports,omitempty" yaml:"ports,omitempty"`
+	Name      string               `json:"name" yaml:"name"`
+	Image     string               `json:"image" yaml:"image"`
+	Command   []string             `json:"command,omitempty" yaml:"command,omitempty"`
+	Args      []string             `json:"args,omitempty" yaml:"args,omitempty"`
+	Ports     []ContainerPort      `json:"ports,omitempty" yaml:"ports,omitempty"`
+	Resources ResourceRequirements `json:"resources,omitempty" yaml:"resources,omitempty"`
 }
 
 // PodSpec describes desired state of a Pod.
@@ -288,6 +302,101 @@ type RoleBinding struct {
 
 // ClusterRoleBinding is the cluster-scoped RoleBinding.
 type ClusterRoleBinding = RoleBinding
+
+// ---------------- M5: Admission Webhooks ----------------
+
+// AdmissionReviewRequest is the body POSTed to a webhook before a resource
+// is persisted. Kind identifies the object kind, Operation is "CREATE" or
+// "UPDATE", and Object is the raw resource JSON.
+type AdmissionReviewRequest struct {
+	UID       string          `json:"uid"`
+	Kind      string          `json:"kind"`
+	Resource  string          `json:"resource"`
+	Namespace string          `json:"namespace,omitempty"`
+	Name      string          `json:"name,omitempty"`
+	Operation string          `json:"operation"`
+	Object    json.RawMessage `json:"object"`
+}
+
+// AdmissionReviewResponse is what a webhook returns. If Allowed is false,
+// the request is rejected with Message. If Patch is non-empty, it replaces
+// the incoming object before persistence (mutating webhook).
+type AdmissionReviewResponse struct {
+	UID     string          `json:"uid"`
+	Allowed bool            `json:"allowed"`
+	Message string          `json:"message,omitempty"`
+	Patch   json.RawMessage `json:"patch,omitempty"`
+}
+
+// AdmissionWebhookType is mutating or validating.
+const (
+	WebhookTypeMutating   = "Mutating"
+	WebhookTypeValidating = "Validating"
+)
+
+// AdmissionWebhook registers a remote webhook endpoint that the apiserver
+// consults before persisting resources.
+type AdmissionWebhook struct {
+	APIVersion string   `json:"apiVersion,omitempty" yaml:"apiVersion,omitempty"`
+	Kind       string   `json:"kind,omitempty" yaml:"kind,omitempty"`
+	Metadata   Metadata `json:"metadata" yaml:"metadata"`
+	// Type is Mutating or Validating.
+	Type string `json:"type" yaml:"type"`
+	// URL is the full webhook URL (http://host:port/path).
+	URL string `json:"url" yaml:"url"`
+	// Resources are the lowercase plurals this webhook cares about
+	// (e.g. ["pods","deployments"]). "*" matches any resource.
+	Resources []string `json:"resources" yaml:"resources"`
+	// FailurePolicy is "Fail" (deny on webhook error) or "Ignore".
+	FailurePolicy string `json:"failurePolicy,omitempty" yaml:"failurePolicy,omitempty"`
+}
+
+// ---------------- M5: HPA ----------------
+
+// HPAMetric describes the target metric. Only "cpu" with averageUtilization
+// is supported in M5.
+type HPAMetric struct {
+	Type               string `json:"type" yaml:"type"` // Resource
+	Name               string `json:"name" yaml:"name"` // cpu
+	TargetAverageValue int    `json:"targetAverageUtilization" yaml:"targetAverageUtilization"`
+}
+
+// HPASpec describes desired HPA behavior.
+type HPASpec struct {
+	ScaleTargetRef struct {
+		Kind string `json:"kind" yaml:"kind"`
+		Name string `json:"name" yaml:"name"`
+	} `json:"scaleTargetRef" yaml:"scaleTargetRef"`
+	MinReplicas int       `json:"minReplicas" yaml:"minReplicas"`
+	MaxReplicas int       `json:"maxReplicas" yaml:"maxReplicas"`
+	Metric      HPAMetric `json:"metric" yaml:"metric"`
+}
+
+// HPAStatus is the observed state.
+type HPAStatus struct {
+	CurrentReplicas     int       `json:"currentReplicas"`
+	DesiredReplicas     int       `json:"desiredReplicas"`
+	CurrentAverageValue int       `json:"currentAverageUtilization"`
+	LastScaleTime       time.Time `json:"lastScaleTime"`
+	LastUpdated         time.Time `json:"lastUpdated"`
+}
+
+// HorizontalPodAutoscaler scales a Deployment between min and max replicas
+// based on a metric (CPU %).
+type HPA struct {
+	APIVersion string    `json:"apiVersion,omitempty" yaml:"apiVersion,omitempty"`
+	Kind       string    `json:"kind,omitempty" yaml:"kind,omitempty"`
+	Metadata   Metadata  `json:"metadata" yaml:"metadata"`
+	Spec       HPASpec   `json:"spec" yaml:"spec"`
+	Status     HPAStatus `json:"status,omitempty" yaml:"status,omitempty"`
+}
+
+// PodMetric is the metrics-server view of a pod's resource usage.
+type PodMetric struct {
+	PodName  string  `json:"podName"`
+	NodeName string  `json:"nodeName"`
+	CPUPct   float64 `json:"cpuPct"`
+}
 
 // User is an identity that authenticates via a bearer token. In a real
 // cluster this would come from certs/OIDC; for M4 we store token→user

@@ -103,6 +103,10 @@ func applyCmd(server string, args []string) {
 		applyDeployment(server, data)
 	case "Service":
 		applyService(server, data)
+	case "AdmissionWebhook":
+		applyWebhook(server, data)
+	case "HorizontalPodAutoscaler":
+		applyHPA(server, data)
 	default:
 		die("unsupported kind %q", peek.Kind)
 	}
@@ -162,6 +166,38 @@ func applyReplicaSet(server string, data []byte) {
 	fmt.Printf("replicaset/%s applied (replicas=%d)\n", out.Metadata.Name, out.Spec.Replicas)
 }
 
+func applyWebhook(server string, data []byte) {
+	var h api.AdmissionWebhook
+	if err := yaml.Unmarshal(data, &h); err != nil {
+		die("parse yaml: %v", err)
+	}
+	if h.Metadata.Name == "" {
+		die("metadata.name required")
+	}
+	body, _ := json.Marshal(h)
+	resp, err := http.Post(server+"/apis/admission.mk.io/v1/webhooks", "application/json", bytes.NewReader(body))
+	check(resp, err, "apply webhook")
+	defer resp.Body.Close()
+	fmt.Printf("admissionwebhook/%s applied (type=%s url=%s)\n", h.Metadata.Name, h.Type, h.URL)
+}
+
+func applyHPA(server string, data []byte) {
+	var h api.HPA
+	if err := yaml.Unmarshal(data, &h); err != nil {
+		die("parse yaml: %v", err)
+	}
+	if h.Metadata.Name == "" {
+		die("metadata.name required")
+	}
+	body, _ := json.Marshal(h)
+	resp, err := http.Post(server+"/apis/autoscaling.mk.io/v1/horizontalpodautoscalers", "application/json", bytes.NewReader(body))
+	check(resp, err, "apply hpa")
+	defer resp.Body.Close()
+	var out api.HPA
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	fmt.Printf("hpa/%s applied (target=%s/%s min=%d max=%d)\n", out.Metadata.Name, out.Spec.ScaleTargetRef.Kind, out.Spec.ScaleTargetRef.Name, out.Spec.MinReplicas, out.Spec.MaxReplicas)
+}
+
 func applyDeployment(server string, data []byte) {
 	var d api.Deployment
 	if err := yaml.Unmarshal(data, &d); err != nil {
@@ -194,6 +230,10 @@ func getCmd(server string, args []string) {
 		getServices(server)
 	case "endpoints", "ep", "endpoint":
 		getEndpoints(server)
+	case "hpa", "horizontalpodautoscalers":
+		getHPAs(server)
+	case "webhooks", "admissionwebhooks":
+		getWebhooks(server)
 	default:
 		die("unknown resource %q", args[0])
 	}
@@ -343,6 +383,58 @@ func getDeployments(server string) {
 		age := now.Sub(d.Status.LastUpdated).Truncate(time.Second).String()
 		fmt.Fprintf(tw, "%s\t%d\t%d\t%d\t%s\t%s\n",
 			d.Metadata.Name, d.Spec.Replicas, d.Status.Replicas, d.Status.ReadyReplicas, img, age)
+	}
+	tw.Flush()
+}
+
+func getHPAs(server string) {
+	resp, err := http.Get(server + "/apis/autoscaling.mk.io/v1/horizontalpodautoscalers")
+	check(resp, err, "get hpa")
+	defer resp.Body.Close()
+	var list struct {
+		Items []*api.HPA `json:"items"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		die("decode: %v", err)
+	}
+	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "NAME\tTARGET\tMIN\tMAX\tCURRENT\tDESIRED\tCPU%\tLAST-SCALE")
+	for _, h := range list.Items {
+		last := "<never>"
+		if !h.Status.LastScaleTime.IsZero() {
+			last = time.Since(h.Status.LastScaleTime).Truncate(time.Second).String() + " ago"
+		}
+		fmt.Fprintf(tw, "%s\t%s/%s\t%d\t%d\t%d\t%d\t%d\t%s\n",
+			h.Metadata.Name,
+			h.Spec.ScaleTargetRef.Kind, h.Spec.ScaleTargetRef.Name,
+			h.Spec.MinReplicas, h.Spec.MaxReplicas,
+			h.Status.CurrentReplicas, h.Status.DesiredReplicas,
+			h.Status.CurrentAverageValue, last)
+	}
+	tw.Flush()
+}
+
+func getWebhooks(server string) {
+	resp, err := http.Get(server + "/apis/admission.mk.io/v1/webhooks")
+	check(resp, err, "get webhooks")
+	defer resp.Body.Close()
+	var list struct {
+		Items []*api.AdmissionWebhook `json:"items"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		die("decode: %v", err)
+	}
+	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "NAME\tTYPE\tRESOURCES\tURL\tFAILURE-POLICY")
+	for _, h := range list.Items {
+		res := ""
+		for i, r := range h.Resources {
+			if i > 0 {
+				res += ","
+			}
+			res += r
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", h.Metadata.Name, h.Type, res, h.URL, h.FailurePolicy)
 	}
 	tw.Flush()
 }

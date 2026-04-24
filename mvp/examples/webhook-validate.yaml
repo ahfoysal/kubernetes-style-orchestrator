@@ -1,0 +1,9 @@
+apiVersion: admission.mk.io/v1
+kind: AdmissionWebhook
+metadata:
+  name: require-memlimit
+type: Validating
+url: http://127.0.0.1:9443/validate-memlimit
+resources:
+  - pods
+failurePolicy: Fail
