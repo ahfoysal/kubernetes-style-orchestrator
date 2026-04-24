@@ -24,6 +24,7 @@ import (
 
 	"github.com/ahfoysal/kubernetes-style-orchestrator/mvp/internal/api"
 	"github.com/ahfoysal/kubernetes-style-orchestrator/mvp/internal/client"
+	"github.com/ahfoysal/kubernetes-style-orchestrator/mvp/internal/netpol"
 )
 
 type proxyKey struct {
@@ -42,22 +43,32 @@ type proxyEntry struct {
 }
 
 type proxy struct {
-	cli     *client.Client
-	mu      sync.Mutex
-	entries map[proxyKey]*proxyEntry
+	cli      *client.Client
+	mu       sync.Mutex
+	entries  map[proxyKey]*proxyEntry
+	// Cached cluster view refreshed each sync tick. NetPol enforcement
+	// reads these under atomic loads so the accept path never blocks.
+	policies atomic.Value // []*api.NetworkPolicy
+	pods     atomic.Value // []*api.Pod
+	// netpolEnforce toggles whether policy denials actually drop traffic.
+	netpolEnforce bool
 }
 
 func main() {
 	apiAddr := flag.String("api", "http://127.0.0.1:8080", "apiserver base URL")
 	interval := flag.Duration("interval", 2*time.Second, "sync interval")
+	netpolEnforce := flag.Bool("netpol", true, "enforce NetworkPolicy (drop disallowed pod->pod connections)")
 	flag.Parse()
 
 	p := &proxy{
-		cli:     client.New(*apiAddr),
-		entries: map[proxyKey]*proxyEntry{},
+		cli:           client.New(*apiAddr),
+		entries:       map[proxyKey]*proxyEntry{},
+		netpolEnforce: *netpolEnforce,
 	}
+	p.policies.Store([]*api.NetworkPolicy{})
+	p.pods.Store([]*api.Pod{})
 
-	log.Printf("mk-kube-proxy: api=%s interval=%s", *apiAddr, *interval)
+	log.Printf("mk-kube-proxy: api=%s interval=%s netpol=%v", *apiAddr, *interval, *netpolEnforce)
 	for {
 		if err := p.sync(); err != nil {
 			log.Printf("sync error: %v", err)
@@ -70,6 +81,14 @@ func (p *proxy) sync() error {
 	svcs, err := p.cli.ListServices()
 	if err != nil {
 		return err
+	}
+	// Refresh NetworkPolicy + Pod cache; tolerate transient apiserver
+	// hiccups (empty list is "no policies" = allow-all).
+	if pols, err := p.cli.ListNetworkPolicies(); err == nil {
+		p.policies.Store(pols)
+	}
+	if pods, err := p.cli.ListPods(); err == nil {
+		p.pods.Store(pods)
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -98,7 +117,7 @@ func (p *proxy) sync() error {
 				entry = &proxyEntry{key: key, clusterIP: svc.Spec.ClusterIP, ln: ln}
 				entry.backends.Store(ep.Subsets)
 				p.entries[key] = entry
-				go acceptLoop(entry, svc.Metadata.Name)
+				go p.acceptLoop(entry, svc.Metadata.Name)
 				log.Printf("kube-proxy: service=%s listening %s:%d backends=%d",
 					svc.Metadata.Name, svc.Spec.ClusterIP, sp.Port, len(ep.Subsets))
 			} else {
@@ -117,18 +136,18 @@ func (p *proxy) sync() error {
 	return nil
 }
 
-func acceptLoop(e *proxyEntry, svcName string) {
+func (p *proxy) acceptLoop(e *proxyEntry, svcName string) {
 	for {
 		conn, err := e.ln.Accept()
 		if err != nil {
 			log.Printf("kube-proxy: service=%s accept: %v", svcName, err)
 			return
 		}
-		go handle(e, svcName, conn)
+		go p.handle(e, svcName, conn)
 	}
 }
 
-func handle(e *proxyEntry, svcName string, client net.Conn) {
+func (p *proxy) handle(e *proxyEntry, svcName string, client net.Conn) {
 	defer client.Close()
 	subs, _ := e.backends.Load().([]api.EndpointAddress)
 	if len(subs) == 0 {
@@ -138,6 +157,33 @@ func handle(e *proxyEntry, svcName string, client net.Conn) {
 	// Round-robin using atomic counter.
 	idx := int(atomic.AddUint64(&e.counter, 1)-1) % len(subs)
 	ep := subs[idx]
+
+	// ---- NetworkPolicy enforcement ----
+	// Map caller's source port back to a pod (stub runtime publishes a
+	// unique loopback port per pod so this is a reliable pod identifier
+	// within the MVP). Map the destination endpoint port back to the dst
+	// pod likewise, then ask the evaluator.
+	if p.netpolEnforce {
+		policies, _ := p.policies.Load().([]*api.NetworkPolicy)
+		pods, _ := p.pods.Load().([]*api.Pod)
+		srcPort := 0
+		if ta, ok := client.RemoteAddr().(*net.TCPAddr); ok {
+			srcPort = ta.Port
+		}
+		srcPod := netpol.PodByHostPort(pods, srcPort)
+		dstPod := findPodByName(pods, ep.PodName)
+		dstContainerPort := ep.Port
+		if dstPod != nil && len(dstPod.Spec.Containers) > 0 && len(dstPod.Spec.Containers[0].Ports) > 0 {
+			dstContainerPort = dstPod.Spec.Containers[0].Ports[0].ContainerPort
+		}
+		dec := netpol.Evaluate(policies, srcPod, dstPod, dstContainerPort)
+		if !dec.Allowed {
+			log.Printf("kube-proxy: service=%s NETPOL DENY src=%s dst=pod/%s policy=%s reason=%s",
+				svcName, podLabel(srcPod), ep.PodName, dec.Policy, dec.Reason)
+			return
+		}
+	}
+
 	upstream := fmt.Sprintf("%s:%d", ep.IP, ep.Port)
 	backend, err := net.DialTimeout("tcp", upstream, 2*time.Second)
 	if err != nil {
@@ -153,4 +199,22 @@ func handle(e *proxyEntry, svcName string, client net.Conn) {
 	go func() { _, _ = io.Copy(backend, client); done <- struct{}{} }()
 	go func() { _, _ = io.Copy(client, backend); done <- struct{}{} }()
 	<-done
+}
+
+// findPodByName returns the pod with the given name (or nil).
+func findPodByName(pods []*api.Pod, name string) *api.Pod {
+	for _, pod := range pods {
+		if pod.Metadata.Name == name {
+			return pod
+		}
+	}
+	return nil
+}
+
+// podLabel prints a short src-pod identifier for logs.
+func podLabel(p *api.Pod) string {
+	if p == nil {
+		return "external"
+	}
+	return "pod/" + p.Metadata.Name
 }

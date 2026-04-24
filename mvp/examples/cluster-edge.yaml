@@ -1,0 +1,7 @@
+apiVersion: federation.mk.io/v1
+kind: Cluster
+metadata:
+  name: edge-1
+spec:
+  server: http://127.0.0.1:8081
+  region: us-east

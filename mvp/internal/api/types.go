@@ -398,6 +398,94 @@ type PodMetric struct {
 	CPUPct   float64 `json:"cpuPct"`
 }
 
+// ---------------- M6: NetworkPolicy ----------------
+
+// NetPolPeer selects pods by label. Empty PodSelector means "all pods".
+type NetPolPeer struct {
+	PodSelector map[string]string `json:"podSelector,omitempty" yaml:"podSelector,omitempty"`
+}
+
+// NetPolPort describes an allowed port. Protocol defaults to TCP.
+type NetPolPort struct {
+	Port     int    `json:"port" yaml:"port"`
+	Protocol string `json:"protocol,omitempty" yaml:"protocol,omitempty"`
+}
+
+// NetPolIngressRule is an allow-list: traffic from any of From whose port
+// is in Ports is permitted. Empty From = any source; empty Ports = any port.
+type NetPolIngressRule struct {
+	From  []NetPolPeer `json:"from,omitempty" yaml:"from,omitempty"`
+	Ports []NetPolPort `json:"ports,omitempty" yaml:"ports,omitempty"`
+}
+
+// NetPolSpec selects target pods via PodSelector and specifies the set of
+// ingress rules that allow traffic to them. A selected pod with no rules
+// is effectively isolated (default-deny).
+type NetPolSpec struct {
+	PodSelector map[string]string   `json:"podSelector" yaml:"podSelector"`
+	Ingress     []NetPolIngressRule `json:"ingress,omitempty" yaml:"ingress,omitempty"`
+	// PolicyTypes usually ["Ingress"]; we only implement Ingress in M6.
+	PolicyTypes []string `json:"policyTypes,omitempty" yaml:"policyTypes,omitempty"`
+}
+
+// NetworkPolicy isolates selected pods and allow-lists specific peers.
+type NetworkPolicy struct {
+	APIVersion string     `json:"apiVersion,omitempty" yaml:"apiVersion,omitempty"`
+	Kind       string     `json:"kind,omitempty" yaml:"kind,omitempty"`
+	Metadata   Metadata   `json:"metadata" yaml:"metadata"`
+	Spec       NetPolSpec `json:"spec" yaml:"spec"`
+}
+
+// ---------------- M6: Multi-cluster federation ----------------
+
+// Cluster is a member cluster reachable from the control plane. The
+// control plane lists clusters + their heartbeat status.
+type ClusterStatus struct {
+	Ready         bool      `json:"ready" yaml:"ready"`
+	LastHeartbeat time.Time `json:"lastHeartbeat" yaml:"lastHeartbeat"`
+	Message       string    `json:"message,omitempty" yaml:"message,omitempty"`
+}
+
+type ClusterSpec struct {
+	// Server is the reachable apiserver URL of the member cluster.
+	Server string `json:"server" yaml:"server"`
+	// Region is an informational label for placement preferences.
+	Region string `json:"region,omitempty" yaml:"region,omitempty"`
+}
+
+type Cluster struct {
+	APIVersion string        `json:"apiVersion,omitempty" yaml:"apiVersion,omitempty"`
+	Kind       string        `json:"kind,omitempty" yaml:"kind,omitempty"`
+	Metadata   Metadata      `json:"metadata" yaml:"metadata"`
+	Spec       ClusterSpec   `json:"spec" yaml:"spec"`
+	Status     ClusterStatus `json:"status,omitempty" yaml:"status,omitempty"`
+}
+
+// FederatedDeploymentSpec fans a Deployment out to all listed clusters
+// (or every registered cluster when Clusters is empty).
+type FederatedDeploymentSpec struct {
+	Clusters []string       `json:"clusters,omitempty" yaml:"clusters,omitempty"`
+	Template DeploymentSpec `json:"template" yaml:"template"`
+}
+
+// FederatedDeploymentStatus reports how many clusters are currently in sync.
+type FederatedDeploymentStatus struct {
+	ClusterCount int       `json:"clusterCount" yaml:"clusterCount"`
+	ReadyCount   int       `json:"readyCount" yaml:"readyCount"`
+	LastUpdated  time.Time `json:"lastUpdated" yaml:"lastUpdated"`
+}
+
+// FederatedDeployment is replicated across member clusters by the federation
+// controller. Each member cluster receives a derived Deployment object with
+// the same name.
+type FederatedDeployment struct {
+	APIVersion string                    `json:"apiVersion,omitempty" yaml:"apiVersion,omitempty"`
+	Kind       string                    `json:"kind,omitempty" yaml:"kind,omitempty"`
+	Metadata   Metadata                  `json:"metadata" yaml:"metadata"`
+	Spec       FederatedDeploymentSpec   `json:"spec" yaml:"spec"`
+	Status     FederatedDeploymentStatus `json:"status,omitempty" yaml:"status,omitempty"`
+}
+
 // User is an identity that authenticates via a bearer token. In a real
 // cluster this would come from certs/OIDC; for M4 we store token→user
 // in the apiserver's DB.

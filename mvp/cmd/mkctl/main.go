@@ -107,9 +107,60 @@ func applyCmd(server string, args []string) {
 		applyWebhook(server, data)
 	case "HorizontalPodAutoscaler":
 		applyHPA(server, data)
+	case "NetworkPolicy":
+		applyNetworkPolicy(server, data)
+	case "Cluster":
+		applyCluster(server, data)
+	case "FederatedDeployment":
+		applyFederatedDeployment(server, data)
 	default:
 		die("unsupported kind %q", peek.Kind)
 	}
+}
+
+func applyNetworkPolicy(server string, data []byte) {
+	var np api.NetworkPolicy
+	if err := yaml.Unmarshal(data, &np); err != nil {
+		die("parse yaml: %v", err)
+	}
+	if np.Metadata.Name == "" {
+		die("metadata.name required")
+	}
+	body, _ := json.Marshal(np)
+	resp, err := http.Post(server+"/apis/networking.mk.io/v1/networkpolicies", "application/json", bytes.NewReader(body))
+	check(resp, err, "apply networkpolicy")
+	defer resp.Body.Close()
+	fmt.Printf("networkpolicy/%s applied\n", np.Metadata.Name)
+}
+
+func applyCluster(server string, data []byte) {
+	var c api.Cluster
+	if err := yaml.Unmarshal(data, &c); err != nil {
+		die("parse yaml: %v", err)
+	}
+	if c.Metadata.Name == "" || c.Spec.Server == "" {
+		die("metadata.name and spec.server required")
+	}
+	body, _ := json.Marshal(c)
+	resp, err := http.Post(server+"/apis/federation.mk.io/v1/clusters", "application/json", bytes.NewReader(body))
+	check(resp, err, "apply cluster")
+	defer resp.Body.Close()
+	fmt.Printf("cluster/%s applied (server=%s)\n", c.Metadata.Name, c.Spec.Server)
+}
+
+func applyFederatedDeployment(server string, data []byte) {
+	var fd api.FederatedDeployment
+	if err := yaml.Unmarshal(data, &fd); err != nil {
+		die("parse yaml: %v", err)
+	}
+	if fd.Metadata.Name == "" {
+		die("metadata.name required")
+	}
+	body, _ := json.Marshal(fd)
+	resp, err := http.Post(server+"/apis/federation.mk.io/v1/federateddeployments", "application/json", bytes.NewReader(body))
+	check(resp, err, "apply federateddeployment")
+	defer resp.Body.Close()
+	fmt.Printf("federateddeployment/%s applied (clusters=%v)\n", fd.Metadata.Name, fd.Spec.Clusters)
 }
 
 func applyService(server string, data []byte) {
@@ -234,9 +285,91 @@ func getCmd(server string, args []string) {
 		getHPAs(server)
 	case "webhooks", "admissionwebhooks":
 		getWebhooks(server)
+	case "networkpolicies", "netpol", "networkpolicy":
+		getNetworkPolicies(server)
+	case "clusters", "cluster":
+		getClusters(server)
+	case "federateddeployments", "fd", "federateddeployment":
+		getFederatedDeployments(server)
 	default:
 		die("unknown resource %q", args[0])
 	}
+}
+
+func getNetworkPolicies(server string) {
+	resp, err := http.Get(server + "/apis/networking.mk.io/v1/networkpolicies")
+	check(resp, err, "get networkpolicies")
+	defer resp.Body.Close()
+	var list struct {
+		Items []*api.NetworkPolicy `json:"items"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		die("decode: %v", err)
+	}
+	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "NAME\tSELECTOR\tINGRESS-RULES")
+	for _, np := range list.Items {
+		sel := ""
+		for k, v := range np.Spec.PodSelector {
+			if sel != "" {
+				sel += ","
+			}
+			sel += k + "=" + v
+		}
+		if sel == "" {
+			sel = "<all>"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%d\n", np.Metadata.Name, sel, len(np.Spec.Ingress))
+	}
+	tw.Flush()
+}
+
+func getClusters(server string) {
+	resp, err := http.Get(server + "/apis/federation.mk.io/v1/clusters")
+	check(resp, err, "get clusters")
+	defer resp.Body.Close()
+	var list struct {
+		Items []*api.Cluster `json:"items"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		die("decode: %v", err)
+	}
+	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "NAME\tSERVER\tREGION\tREADY\tLAST-HEARTBEAT")
+	now := time.Now()
+	for _, c := range list.Items {
+		hb := "<never>"
+		if !c.Status.LastHeartbeat.IsZero() {
+			hb = now.Sub(c.Status.LastHeartbeat).Truncate(time.Second).String() + " ago"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%v\t%s\n",
+			c.Metadata.Name, c.Spec.Server, nz(c.Spec.Region, "-"), c.Status.Ready, hb)
+	}
+	tw.Flush()
+}
+
+func getFederatedDeployments(server string) {
+	resp, err := http.Get(server + "/apis/federation.mk.io/v1/federateddeployments")
+	check(resp, err, "get federateddeployments")
+	defer resp.Body.Close()
+	var list struct {
+		Items []*api.FederatedDeployment `json:"items"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		die("decode: %v", err)
+	}
+	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "NAME\tREPLICAS\tCLUSTERS\tREADY-CLUSTERS")
+	for _, fd := range list.Items {
+		target := "<all>"
+		if len(fd.Spec.Clusters) > 0 {
+			target = fmt.Sprintf("%v", fd.Spec.Clusters)
+		}
+		fmt.Fprintf(tw, "%s\t%d\t%s\t%d/%d\n",
+			fd.Metadata.Name, fd.Spec.Template.Replicas, target,
+			fd.Status.ReadyCount, fd.Status.ClusterCount)
+	}
+	tw.Flush()
 }
 
 func getServices(server string) {
