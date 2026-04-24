@@ -1,0 +1,13 @@
+apiVersion: networking.mk.io/v1
+kind: NetworkPolicy
+metadata:
+  name: backend-allow-frontend
+spec:
+  podSelector:
+    app: backend
+  ingress:
+    - from:
+        - podSelector:
+            app: frontend
+      ports:
+        - port: 8080

@@ -1,0 +1,9 @@
+apiVersion: admission.mk.io/v1
+kind: AdmissionWebhook
+metadata:
+  name: sidecar-injector
+type: Mutating
+url: http://127.0.0.1:9444/inject-sidecar
+resources:
+  - pods
+failurePolicy: Ignore

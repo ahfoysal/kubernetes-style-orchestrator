@@ -19,6 +19,7 @@ import (
 	"github.com/ahfoysal/kubernetes-style-orchestrator/mvp/internal/client"
 	"github.com/ahfoysal/kubernetes-style-orchestrator/mvp/internal/controllers"
 	"github.com/ahfoysal/kubernetes-style-orchestrator/mvp/internal/crd"
+	"github.com/ahfoysal/kubernetes-style-orchestrator/mvp/internal/federation"
 	"github.com/ahfoysal/kubernetes-style-orchestrator/mvp/internal/hpa"
 	"github.com/ahfoysal/kubernetes-style-orchestrator/mvp/internal/rbac"
 	"github.com/ahfoysal/kubernetes-style-orchestrator/mvp/internal/store"
@@ -147,6 +148,9 @@ func main() {
 	// M5: observability — show who holds the controller-manager lease.
 	mux.HandleFunc("/apis/coordination.mk.io/v1/leases/", s.handleLease)
 
+	// M6: NetworkPolicy + Cluster + FederatedDeployment routes.
+	s.registerM6Routes(mux)
+
 	// Catch-all for dynamic CR paths: /apis/{group}/{version}/{plural}[/{name}]
 	// Routes that matched a static handler above won't reach this.
 	mux.HandleFunc("/apis/", s.handleDynamicCR)
@@ -206,11 +210,14 @@ func (s *server) startControllers(ctx context.Context, apiSelf, metricsURL strin
 	sc := controllers.NewServiceController(c, 1*time.Second)
 	hc := hpa.New(c, metricsURL, 2*time.Second)
 
+	fc := federation.New(c, 3*time.Second)
+
 	stop := make(chan struct{})
 	go rc.Run(stop)
 	go dc.Run(stop)
 	go sc.Run(stop)
 	go hc.Run(stop)
+	go fc.Run(stop)
 
 	<-ctx.Done()
 	close(stop)

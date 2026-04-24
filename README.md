@@ -312,13 +312,123 @@ hello from pod hello-rs-3443f (image=alpine:3.20 port=62195)
 hello from pod hello-rs-8cccf (image=alpine:3.20 port=54645)
 ```
 
+## M6 Status — NetworkPolicy + Service Mesh Sidecars (mTLS) + Multi-cluster Federation (DONE)
+
+M6 layers three big Kubernetes concepts on top of the M5 control plane:
+
+1. **NetworkPolicy** — label-selector-based L4 ingress filtering enforced
+   in `mk-kube-proxy`. Matches upstream semantics: an unselected pod is
+   allow-all; once any policy selects a pod, only explicitly allow-listed
+   peers + ports may reach it (default-deny).
+2. **Service-mesh sidecar (`mk-sidecar`)** — a tiny Go proxy that
+   terminates and originates mutual TLS between pods, plus an admission
+   webhook (`mk-sidecar-injector`) that auto-injects the sidecar into
+   any pod carrying `mk.io/inject-sidecar=true`.
+3. **Multi-cluster federation** — `Cluster` + `FederatedDeployment`
+   resources with an in-process controller that probes every member
+   cluster's `/healthz` and fans out derived `Deployment` objects to
+   the healthy ones. Status reports `readyClusters / totalClusters`.
+
+### New resources
+
+| apiVersion                | kind                 | REST path                                                     |
+| ------------------------- | -------------------- | ------------------------------------------------------------- |
+| `networking.mk.io/v1`     | `NetworkPolicy`      | `/apis/networking.mk.io/v1/networkpolicies[/{name}]`          |
+| `federation.mk.io/v1`     | `Cluster`            | `/apis/federation.mk.io/v1/clusters[/{name}[/status]]`        |
+| `federation.mk.io/v1`     | `FederatedDeployment`| `/apis/federation.mk.io/v1/federateddeployments[/{name}[/status]]` |
+
+### New binaries / packages
+
+- **`cmd/mk-sidecar/`** — dual-mode (`-mode=server|client`) TLS proxy.
+  Terminates / originates mTLS between pods; auto-issues a shared CA
+  plus per-pod leaf certs if no paths are provided.
+- **`cmd/mk-sidecar-injector/`** — mutating admission webhook that
+  appends an `mk-sidecar` container to any pod labelled
+  `mk.io/inject-sidecar=true`. Idempotent, opt-in.
+- **`internal/netpol/`** — pure NetworkPolicy evaluator (label match +
+  ingress rule + port check). Called on every inbound connection by
+  `mk-kube-proxy`.
+- **`internal/federation/`** — `Controller` that reconciles
+  `FederatedDeployment` → per-cluster `Deployment` + probes cluster
+  `/healthz` for heartbeat.
+
+### Run the M6 demo (from `mvp/`)
+
+```bash
+mkdir -p data bin
+go build -o bin/mk-apiserver         ./cmd/apiserver
+go build -o bin/mk-scheduler         ./cmd/scheduler
+go build -o bin/mk-kubelet           ./cmd/kubelet
+go build -o bin/mk-controller-manager./cmd/controller-manager
+go build -o bin/mk-kube-proxy        ./cmd/kube-proxy
+go build -o bin/mk-sidecar           ./cmd/mk-sidecar
+go build -o bin/mk-sidecar-injector  ./cmd/mk-sidecar-injector
+go build -o bin/mkctl                ./cmd/mkctl
+
+# Core control plane + data plane.
+./bin/mk-apiserver         -addr :8080 -db data/mk.db &
+./bin/mk-scheduler         -api http://127.0.0.1:8080 -node node-1 -interval 500ms &
+./bin/mk-kubelet           -api http://127.0.0.1:8080 -node node-1 -interval 500ms -docker=false &
+./bin/mk-kube-proxy        -api http://127.0.0.1:8080 -interval 500ms -netpol=true &
+
+# Sidecar injection webhook (registers with apiserver via a webhook CRD).
+./bin/mk-sidecar-injector  -addr :9444 &
+./bin/mkctl apply -f examples/webhook-sidecar-inject.yaml
+
+# Apply workload, then apply NetworkPolicy — connections from
+# non-allowed peers are dropped by mk-kube-proxy (look for
+# "NETPOL DENY" in its log).
+./bin/mkctl apply -f examples/deployment-hello.yaml
+./bin/mkctl apply -f examples/service-hello.yaml
+./bin/mkctl apply -f examples/networkpolicy-allow-frontend.yaml
+./bin/mkctl get networkpolicies
+
+# mTLS between two sidecars on the same host. Sidecar 1 terminates,
+# forwards to a local echo service on :8080; sidecar 2 originates.
+nc -l -p 8080 &                                      # fake workload
+./bin/mk-sidecar -mode=server -listen=:9443 -upstream=127.0.0.1:8080 \
+                 -server-name=pod-a &
+./bin/mk-sidecar -mode=client -listen=127.0.0.1:8081 -upstream=127.0.0.1:9443 \
+                 -server-name=pod-b -peer-name=pod-a &
+echo hello | nc 127.0.0.1 8081                       # plaintext in, mTLS on wire
+
+# Multi-cluster federation: register a second apiserver as a member
+# cluster, apply a FederatedDeployment, verify it appears there.
+./bin/mk-apiserver -addr :8090 -db data/mk-edge.db &
+./bin/mkctl apply -f examples/cluster-edge.yaml      # points at :8081
+./bin/mkctl apply -f examples/federateddeployment-hello.yaml
+./bin/mkctl get clusters
+./bin/mkctl get federateddeployments
+```
+
+Expected:
+
+```
+$ mkctl get networkpolicies
+NAME                     SELECTOR      INGRESS-RULES
+backend-allow-frontend   app=backend   1
+
+$ mkctl get clusters
+NAME    SERVER                   REGION    READY   LAST-HEARTBEAT
+edge-1  http://127.0.0.1:8081    us-east   true    2s ago
+
+$ mkctl get federateddeployments
+NAME    REPLICAS  CLUSTERS   READY-CLUSTERS
+hello   2         <all>      1/1
+```
+
+`mk-kube-proxy` will print `NETPOL DENY` on connections that hit a
+selected destination pod from a non-matching source label set, and
+`NETPOL` is bypassed silently when no policy selects the destination.
+
 ## Milestones
 - **M1 (Week 1):** API server + SQLite store + Pod CRUD + YAML apply — DONE (MVP v0.1)
 - **M2 (Week 3):** Scheduler + node agent runs containers via containerd — scheduler DONE; kubelet runs via docker (containerd migration pending)
 - **M2 (controllers):** Reconciliation loops + ReplicaSet + Deployment controllers — DONE
 - **M3 (Week 6):** Services + Endpoints + kube-proxy-style L4 LB + embedded DNS — DONE
 - **M4:** Rolling update strategy, revision history, horizontal pod autoscaler stub
-- **M5 (Week 12):** CRDs + operator SDK + multi-node + RBAC
+- **M5 (Week 12):** CRDs + operator SDK + multi-node + RBAC — DONE
+- **M6:** NetworkPolicy + service-mesh sidecars (mTLS) + multi-cluster federation — DONE
 
 ## Key References
 - "Kubernetes: Up & Running"

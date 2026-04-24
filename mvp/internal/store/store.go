@@ -35,6 +35,9 @@ func Open(path string) (*Store, error) {
 	if err := s.migrate(); err != nil {
 		return nil, err
 	}
+	if err := s.EnsureM6Tables(); err != nil {
+		return nil, err
+	}
 	return s, nil
 }
 
