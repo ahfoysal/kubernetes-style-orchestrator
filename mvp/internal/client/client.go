@@ -17,10 +17,17 @@ import (
 type Client struct {
 	Base string
 	HTTP *http.Client
+	// Token is an optional bearer token sent in Authorization.
+	Token string
 }
 
 func New(base string) *Client {
 	return &Client{Base: base, HTTP: http.DefaultClient}
+}
+
+// NewWithToken returns a client that attaches Authorization: Bearer <token>.
+func NewWithToken(base, token string) *Client {
+	return &Client{Base: base, HTTP: http.DefaultClient, Token: token}
 }
 
 func (c *Client) do(method, path string, body interface{}, out interface{}) error {
@@ -38,6 +45,9 @@ func (c *Client) do(method, path string, body interface{}, out interface{}) erro
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	if c.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.Token)
 	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
@@ -197,4 +207,124 @@ func (c *Client) GetEndpoints(name string) (*api.Endpoints, error) {
 
 func (c *Client) UpsertEndpoints(ep *api.Endpoints) error {
 	return c.do(http.MethodPost, "/api/v1/endpoints", ep, nil)
+}
+
+// ---------- Nodes (M4) ----------
+
+func (c *Client) ListNodes() ([]*api.Node, error) {
+	var out struct {
+		Items []*api.Node `json:"items"`
+	}
+	if err := c.do(http.MethodGet, "/api/v1/nodes", nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Items, nil
+}
+
+func (c *Client) RegisterNode(n *api.Node) (*api.Node, error) {
+	var out api.Node
+	if err := c.do(http.MethodPost, "/api/v1/nodes", n, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) DeleteNode(name string) error {
+	return c.do(http.MethodDelete, "/api/v1/nodes/"+name, nil, nil)
+}
+
+// ---------- CRDs + Custom Resources (M4) ----------
+
+func (c *Client) ListCRDs() ([]*api.CRD, error) {
+	var out struct {
+		Items []*api.CRD `json:"items"`
+	}
+	if err := c.do(http.MethodGet, "/apis/mk.io/v1/customresourcedefinitions", nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Items, nil
+}
+
+func (c *Client) GetCRD(name string) (*api.CRD, error) {
+	var out api.CRD
+	if err := c.do(http.MethodGet, "/apis/mk.io/v1/customresourcedefinitions/"+name, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) CreateCRD(crd *api.CRD) (*api.CRD, error) {
+	var out api.CRD
+	if err := c.do(http.MethodPost, "/apis/mk.io/v1/customresourcedefinitions", crd, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) DeleteCRD(name string) error {
+	return c.do(http.MethodDelete, "/apis/mk.io/v1/customresourcedefinitions/"+name, nil, nil)
+}
+
+// ListCustomResources lists CRs for the given CRD object name (e.g.
+// "databases.mk.io"). The path is the dynamic REST path under
+// /apis/{group}/{version}/{plural}.
+func (c *Client) ListCustomResources(crdName string) ([]*api.CustomResource, error) {
+	crd, err := c.GetCRD(crdName)
+	if err != nil {
+		return nil, err
+	}
+	path := "/apis/" + crd.Spec.Group + "/" + crd.Spec.Version + "/" + crd.Spec.Names.Plural
+	var out struct {
+		Items []*api.CustomResource `json:"items"`
+	}
+	if err := c.do(http.MethodGet, path, nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Items, nil
+}
+
+func (c *Client) CreateCustomResource(group, version, plural string, cr *api.CustomResource) (*api.CustomResource, error) {
+	var out api.CustomResource
+	path := "/apis/" + group + "/" + version + "/" + plural
+	if err := c.do(http.MethodPost, path, cr, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) DeleteCustomResource(group, version, plural, name string) error {
+	path := "/apis/" + group + "/" + version + "/" + plural + "/" + name
+	return c.do(http.MethodDelete, path, nil, nil)
+}
+
+// ---------- RBAC (M4) ----------
+
+func (c *Client) CreateUser(u *api.User) error {
+	return c.do(http.MethodPost, "/apis/rbac.mk.io/v1/users", u, nil)
+}
+
+func (c *Client) ListUsers() ([]*api.User, error) {
+	var out struct {
+		Items []*api.User `json:"items"`
+	}
+	if err := c.do(http.MethodGet, "/apis/rbac.mk.io/v1/users", nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Items, nil
+}
+
+func (c *Client) CreateRole(r *api.Role) error {
+	return c.do(http.MethodPost, "/apis/rbac.mk.io/v1/roles", r, nil)
+}
+
+func (c *Client) CreateClusterRole(r *api.Role) error {
+	return c.do(http.MethodPost, "/apis/rbac.mk.io/v1/clusterroles", r, nil)
+}
+
+func (c *Client) CreateRoleBinding(b *api.RoleBinding) error {
+	return c.do(http.MethodPost, "/apis/rbac.mk.io/v1/rolebindings", b, nil)
+}
+
+func (c *Client) CreateClusterRoleBinding(b *api.RoleBinding) error {
+	return c.do(http.MethodPost, "/apis/rbac.mk.io/v1/clusterrolebindings", b, nil)
 }

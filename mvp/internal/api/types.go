@@ -171,3 +171,132 @@ type Endpoints struct {
 	Subsets    []EndpointAddress `json:"subsets" yaml:"subsets"`
 	LastUpdated time.Time        `json:"lastUpdated,omitempty" yaml:"lastUpdated,omitempty"`
 }
+
+// ---------------- Node (M4: multi-node) ----------------
+
+// NodeStatus is observed state of a Node.
+type NodeStatus struct {
+	// Ready is true if the kubelet has checked in within the TTL.
+	Ready         bool      `json:"ready" yaml:"ready"`
+	LastHeartbeat time.Time `json:"lastHeartbeat" yaml:"lastHeartbeat"`
+	// PodCount is the current number of pods scheduled to this node.
+	PodCount int `json:"podCount" yaml:"podCount"`
+	Address  string `json:"address,omitempty" yaml:"address,omitempty"`
+}
+
+// Node represents a registered kubelet.
+type Node struct {
+	APIVersion string     `json:"apiVersion,omitempty" yaml:"apiVersion,omitempty"`
+	Kind       string     `json:"kind,omitempty" yaml:"kind,omitempty"`
+	Metadata   Metadata   `json:"metadata" yaml:"metadata"`
+	Status     NodeStatus `json:"status,omitempty" yaml:"status,omitempty"`
+}
+
+// ---------------- CRD (M4) ----------------
+
+// CRDSchemaProperty is a lightweight JSON-schema-ish property descriptor.
+// We only model type+description for the M4 demo — enough for a kubectl-like
+// UX without pulling in a full JSON schema validator.
+type CRDSchemaProperty struct {
+	Type        string `json:"type,omitempty" yaml:"type,omitempty"`
+	Description string `json:"description,omitempty" yaml:"description,omitempty"`
+}
+
+// CRDSchema describes the shape of a CR's `spec`.
+type CRDSchema struct {
+	Required   []string                     `json:"required,omitempty" yaml:"required,omitempty"`
+	Properties map[string]CRDSchemaProperty `json:"properties,omitempty" yaml:"properties,omitempty"`
+}
+
+// CRDNames declares the REST/CLI names for the CR.
+type CRDNames struct {
+	Kind     string `json:"kind" yaml:"kind"`
+	Plural   string `json:"plural" yaml:"plural"`
+	Singular string `json:"singular,omitempty" yaml:"singular,omitempty"`
+}
+
+// CRDSpec describes a single CustomResourceDefinition.
+type CRDSpec struct {
+	Group   string    `json:"group" yaml:"group"`
+	Version string    `json:"version" yaml:"version"`
+	Names   CRDNames  `json:"names" yaml:"names"`
+	Schema  CRDSchema `json:"schema,omitempty" yaml:"schema,omitempty"`
+	Scope   string    `json:"scope,omitempty" yaml:"scope,omitempty"` // Namespaced|Cluster
+}
+
+// CustomResourceDefinition is a user-declared resource type.
+type CRD struct {
+	APIVersion string    `json:"apiVersion,omitempty" yaml:"apiVersion,omitempty"`
+	Kind       string    `json:"kind,omitempty" yaml:"kind,omitempty"`
+	Metadata   Metadata  `json:"metadata" yaml:"metadata"`
+	Spec       CRDSpec   `json:"spec" yaml:"spec"`
+}
+
+// CustomResource is any instance of a CRD-declared type. The `Object`
+// field holds the raw YAML/JSON body verbatim (sans apiVersion/kind/
+// metadata). Operators decode it themselves against the CRD schema.
+type CustomResource struct {
+	APIVersion string                 `json:"apiVersion,omitempty" yaml:"apiVersion,omitempty"`
+	Kind       string                 `json:"kind,omitempty" yaml:"kind,omitempty"`
+	Metadata   Metadata               `json:"metadata" yaml:"metadata"`
+	Spec       map[string]interface{} `json:"spec,omitempty" yaml:"spec,omitempty"`
+	Status     map[string]interface{} `json:"status,omitempty" yaml:"status,omitempty"`
+}
+
+// ---------------- RBAC (M4) ----------------
+
+// PolicyRule is an RBAC rule: which verbs are allowed on which resources.
+// APIGroups of "*" matches any group; Resources of "*" matches any resource;
+// Verbs of "*" matches any verb.
+type PolicyRule struct {
+	APIGroups []string `json:"apiGroups,omitempty" yaml:"apiGroups,omitempty"`
+	Resources []string `json:"resources,omitempty" yaml:"resources,omitempty"`
+	Verbs     []string `json:"verbs,omitempty" yaml:"verbs,omitempty"`
+}
+
+// Role is a namespaced set of PolicyRules.
+type Role struct {
+	APIVersion string       `json:"apiVersion,omitempty" yaml:"apiVersion,omitempty"`
+	Kind       string       `json:"kind,omitempty" yaml:"kind,omitempty"`
+	Metadata   Metadata     `json:"metadata" yaml:"metadata"`
+	Rules      []PolicyRule `json:"rules" yaml:"rules"`
+}
+
+// ClusterRole is a cluster-scoped Role.
+type ClusterRole = Role
+
+// RoleRef references a Role or ClusterRole by name+kind.
+type RoleRef struct {
+	Kind string `json:"kind" yaml:"kind"` // Role|ClusterRole
+	Name string `json:"name" yaml:"name"`
+}
+
+// Subject is the principal a binding grants a role to.
+type Subject struct {
+	Kind string `json:"kind" yaml:"kind"` // User|Group|ServiceAccount
+	Name string `json:"name" yaml:"name"`
+}
+
+// RoleBinding attaches a role to subjects.
+type RoleBinding struct {
+	APIVersion string    `json:"apiVersion,omitempty" yaml:"apiVersion,omitempty"`
+	Kind       string    `json:"kind,omitempty" yaml:"kind,omitempty"`
+	Metadata   Metadata  `json:"metadata" yaml:"metadata"`
+	Subjects   []Subject `json:"subjects" yaml:"subjects"`
+	RoleRef    RoleRef   `json:"roleRef" yaml:"roleRef"`
+}
+
+// ClusterRoleBinding is the cluster-scoped RoleBinding.
+type ClusterRoleBinding = RoleBinding
+
+// User is an identity that authenticates via a bearer token. In a real
+// cluster this would come from certs/OIDC; for M4 we store token→user
+// in the apiserver's DB.
+type User struct {
+	APIVersion string   `json:"apiVersion,omitempty" yaml:"apiVersion,omitempty"`
+	Kind       string   `json:"kind,omitempty" yaml:"kind,omitempty"`
+	Metadata   Metadata `json:"metadata" yaml:"metadata"`
+	// Token is the bearer token presented in Authorization: Bearer <token>.
+	Token  string   `json:"token" yaml:"token"`
+	Groups []string `json:"groups,omitempty" yaml:"groups,omitempty"`
+}

@@ -92,6 +92,59 @@ func (s *Store) migrate() error {
 	subsets_json TEXT NOT NULL,
 	last_updated DATETIME NOT NULL
 );`,
+		`CREATE TABLE IF NOT EXISTS nodes (
+	name TEXT PRIMARY KEY,
+	metadata_json TEXT NOT NULL,
+	status_json TEXT NOT NULL,
+	created_at DATETIME NOT NULL,
+	last_heartbeat DATETIME NOT NULL
+);`,
+		`CREATE TABLE IF NOT EXISTS crds (
+	name TEXT PRIMARY KEY,
+	group_name TEXT NOT NULL,
+	version TEXT NOT NULL,
+	plural TEXT NOT NULL,
+	kind TEXT NOT NULL,
+	singular TEXT NOT NULL,
+	scope TEXT NOT NULL,
+	spec_json TEXT NOT NULL,
+	metadata_json TEXT NOT NULL,
+	created_at DATETIME NOT NULL
+);`,
+		`CREATE TABLE IF NOT EXISTS custom_resources (
+	crd_name TEXT NOT NULL,
+	name TEXT NOT NULL,
+	namespace TEXT NOT NULL DEFAULT 'default',
+	body_json TEXT NOT NULL,
+	created_at DATETIME NOT NULL,
+	last_updated DATETIME NOT NULL,
+	PRIMARY KEY (crd_name, name)
+);`,
+		`CREATE TABLE IF NOT EXISTS users (
+	name TEXT PRIMARY KEY,
+	token TEXT NOT NULL UNIQUE,
+	groups_json TEXT NOT NULL,
+	created_at DATETIME NOT NULL
+);`,
+		`CREATE TABLE IF NOT EXISTS roles (
+	name TEXT NOT NULL,
+	scope TEXT NOT NULL,
+	namespace TEXT NOT NULL DEFAULT '',
+	rules_json TEXT NOT NULL,
+	metadata_json TEXT NOT NULL,
+	created_at DATETIME NOT NULL,
+	PRIMARY KEY (scope, name)
+);`,
+		`CREATE TABLE IF NOT EXISTS role_bindings (
+	name TEXT NOT NULL,
+	scope TEXT NOT NULL,
+	namespace TEXT NOT NULL DEFAULT '',
+	subjects_json TEXT NOT NULL,
+	roleref_json TEXT NOT NULL,
+	metadata_json TEXT NOT NULL,
+	created_at DATETIME NOT NULL,
+	PRIMARY KEY (scope, name)
+);`,
 	}
 	for _, s1 := range stmts {
 		if _, err := s.db.Exec(s1); err != nil {
@@ -548,6 +601,371 @@ func (s *Store) GetEndpoints(name string) (*api.Endpoints, error) {
 	_ = json.Unmarshal([]byte(subJ), &ep.Subsets)
 	ep.LastUpdated = updated
 	return ep, nil
+}
+
+// ---------------- Nodes (M4) ----------------
+
+// UpsertNode inserts/updates a registered node and stamps last_heartbeat=now.
+func (s *Store) UpsertNode(n *api.Node) error {
+	now := time.Now().UTC()
+	n.Status.LastHeartbeat = now
+	metaB, _ := json.Marshal(n.Metadata)
+	statusB, _ := json.Marshal(n.Status)
+	_, err := s.db.Exec(`INSERT INTO nodes(name, metadata_json, status_json, created_at, last_heartbeat) VALUES(?,?,?,?,?)
+		ON CONFLICT(name) DO UPDATE SET metadata_json=excluded.metadata_json, status_json=excluded.status_json, last_heartbeat=excluded.last_heartbeat`,
+		n.Metadata.Name, string(metaB), string(statusB), now, now)
+	return err
+}
+
+func (s *Store) GetNode(name string) (*api.Node, error) {
+	row := s.db.QueryRow(`SELECT metadata_json, status_json FROM nodes WHERE name=?`, name)
+	var metaJ, statusJ string
+	if err := row.Scan(&metaJ, &statusJ); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	n := &api.Node{APIVersion: "v1", Kind: "Node"}
+	_ = json.Unmarshal([]byte(metaJ), &n.Metadata)
+	_ = json.Unmarshal([]byte(statusJ), &n.Status)
+	return n, nil
+}
+
+func (s *Store) ListNodes() ([]*api.Node, error) {
+	rows, err := s.db.Query(`SELECT metadata_json, status_json FROM nodes ORDER BY created_at ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*api.Node
+	for rows.Next() {
+		var metaJ, statusJ string
+		if err := rows.Scan(&metaJ, &statusJ); err != nil {
+			return nil, err
+		}
+		n := &api.Node{APIVersion: "v1", Kind: "Node"}
+		_ = json.Unmarshal([]byte(metaJ), &n.Metadata)
+		_ = json.Unmarshal([]byte(statusJ), &n.Status)
+		out = append(out, n)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) DeleteNode(name string) error {
+	res, err := s.db.Exec(`DELETE FROM nodes WHERE name=?`, name)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ---------------- CRDs (M4) ----------------
+
+func (s *Store) UpsertCRD(c *api.CRD) error {
+	now := time.Now().UTC()
+	specB, _ := json.Marshal(c.Spec)
+	metaB, _ := json.Marshal(c.Metadata)
+	_, err := s.db.Exec(`INSERT INTO crds(name, group_name, version, plural, kind, singular, scope, spec_json, metadata_json, created_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(name) DO UPDATE SET group_name=excluded.group_name, version=excluded.version, plural=excluded.plural, kind=excluded.kind, singular=excluded.singular, scope=excluded.scope, spec_json=excluded.spec_json, metadata_json=excluded.metadata_json`,
+		c.Metadata.Name, c.Spec.Group, c.Spec.Version, c.Spec.Names.Plural, c.Spec.Names.Kind, c.Spec.Names.Singular, c.Spec.Scope, string(specB), string(metaB), now)
+	return err
+}
+
+func (s *Store) GetCRD(name string) (*api.CRD, error) {
+	row := s.db.QueryRow(`SELECT spec_json, metadata_json FROM crds WHERE name=?`, name)
+	var specJ, metaJ string
+	if err := row.Scan(&specJ, &metaJ); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	c := &api.CRD{APIVersion: "mk.io/v1", Kind: "CustomResourceDefinition"}
+	_ = json.Unmarshal([]byte(specJ), &c.Spec)
+	_ = json.Unmarshal([]byte(metaJ), &c.Metadata)
+	return c, nil
+}
+
+// GetCRDByPlural returns a CRD indexed by its plural REST name (e.g. "databases").
+func (s *Store) GetCRDByPlural(plural string) (*api.CRD, error) {
+	row := s.db.QueryRow(`SELECT spec_json, metadata_json, name FROM crds WHERE plural=?`, plural)
+	var specJ, metaJ, name string
+	if err := row.Scan(&specJ, &metaJ, &name); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	c := &api.CRD{APIVersion: "mk.io/v1", Kind: "CustomResourceDefinition"}
+	_ = json.Unmarshal([]byte(specJ), &c.Spec)
+	_ = json.Unmarshal([]byte(metaJ), &c.Metadata)
+	c.Metadata.Name = name
+	return c, nil
+}
+
+func (s *Store) ListCRDs() ([]*api.CRD, error) {
+	rows, err := s.db.Query(`SELECT spec_json, metadata_json, name FROM crds ORDER BY created_at ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*api.CRD
+	for rows.Next() {
+		var specJ, metaJ, name string
+		if err := rows.Scan(&specJ, &metaJ, &name); err != nil {
+			return nil, err
+		}
+		c := &api.CRD{APIVersion: "mk.io/v1", Kind: "CustomResourceDefinition"}
+		_ = json.Unmarshal([]byte(specJ), &c.Spec)
+		_ = json.Unmarshal([]byte(metaJ), &c.Metadata)
+		c.Metadata.Name = name
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) DeleteCRD(name string) error {
+	res, err := s.db.Exec(`DELETE FROM crds WHERE name=?`, name)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	_, _ = s.db.Exec(`DELETE FROM custom_resources WHERE crd_name=?`, name)
+	return nil
+}
+
+// ---------------- Custom Resources (M4) ----------------
+
+func (s *Store) UpsertCustomResource(crdName string, cr *api.CustomResource) error {
+	now := time.Now().UTC()
+	bodyB, _ := json.Marshal(cr)
+	_, err := s.db.Exec(`INSERT INTO custom_resources(crd_name, name, namespace, body_json, created_at, last_updated)
+		VALUES(?,?,?,?,?,?)
+		ON CONFLICT(crd_name, name) DO UPDATE SET namespace=excluded.namespace, body_json=excluded.body_json, last_updated=excluded.last_updated`,
+		crdName, cr.Metadata.Name, nsOrDefault(cr.Metadata.Namespace), string(bodyB), now, now)
+	return err
+}
+
+func (s *Store) GetCustomResource(crdName, name string) (*api.CustomResource, error) {
+	row := s.db.QueryRow(`SELECT body_json FROM custom_resources WHERE crd_name=? AND name=?`, crdName, name)
+	var bodyJ string
+	if err := row.Scan(&bodyJ); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	cr := &api.CustomResource{}
+	_ = json.Unmarshal([]byte(bodyJ), cr)
+	return cr, nil
+}
+
+func (s *Store) ListCustomResources(crdName string) ([]*api.CustomResource, error) {
+	rows, err := s.db.Query(`SELECT body_json FROM custom_resources WHERE crd_name=? ORDER BY created_at ASC`, crdName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*api.CustomResource
+	for rows.Next() {
+		var bodyJ string
+		if err := rows.Scan(&bodyJ); err != nil {
+			return nil, err
+		}
+		cr := &api.CustomResource{}
+		_ = json.Unmarshal([]byte(bodyJ), cr)
+		out = append(out, cr)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) DeleteCustomResource(crdName, name string) error {
+	res, err := s.db.Exec(`DELETE FROM custom_resources WHERE crd_name=? AND name=?`, crdName, name)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ---------------- Users (M4 RBAC) ----------------
+
+func (s *Store) UpsertUser(u *api.User) error {
+	now := time.Now().UTC()
+	groupsB, _ := json.Marshal(u.Groups)
+	_, err := s.db.Exec(`INSERT INTO users(name, token, groups_json, created_at) VALUES(?,?,?,?)
+		ON CONFLICT(name) DO UPDATE SET token=excluded.token, groups_json=excluded.groups_json`,
+		u.Metadata.Name, u.Token, string(groupsB), now)
+	return err
+}
+
+func (s *Store) GetUserByToken(token string) (*api.User, error) {
+	row := s.db.QueryRow(`SELECT name, token, groups_json FROM users WHERE token=?`, token)
+	var name, tok, gJ string
+	if err := row.Scan(&name, &tok, &gJ); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	u := &api.User{APIVersion: "mk.io/v1", Kind: "User"}
+	u.Metadata.Name = name
+	u.Token = tok
+	_ = json.Unmarshal([]byte(gJ), &u.Groups)
+	return u, nil
+}
+
+func (s *Store) ListUsers() ([]*api.User, error) {
+	rows, err := s.db.Query(`SELECT name, token, groups_json FROM users ORDER BY created_at ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*api.User
+	for rows.Next() {
+		var name, tok, gJ string
+		if err := rows.Scan(&name, &tok, &gJ); err != nil {
+			return nil, err
+		}
+		u := &api.User{APIVersion: "mk.io/v1", Kind: "User"}
+		u.Metadata.Name = name
+		u.Token = tok
+		_ = json.Unmarshal([]byte(gJ), &u.Groups)
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) DeleteUser(name string) error {
+	res, err := s.db.Exec(`DELETE FROM users WHERE name=?`, name)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ---------------- Roles (M4 RBAC) ----------------
+// scope is "Role" or "ClusterRole".
+
+func (s *Store) UpsertRole(scope string, r *api.Role) error {
+	now := time.Now().UTC()
+	rulesB, _ := json.Marshal(r.Rules)
+	metaB, _ := json.Marshal(r.Metadata)
+	_, err := s.db.Exec(`INSERT INTO roles(name, scope, namespace, rules_json, metadata_json, created_at) VALUES(?,?,?,?,?,?)
+		ON CONFLICT(scope, name) DO UPDATE SET namespace=excluded.namespace, rules_json=excluded.rules_json, metadata_json=excluded.metadata_json`,
+		r.Metadata.Name, scope, nsOrDefault(r.Metadata.Namespace), string(rulesB), string(metaB), now)
+	return err
+}
+
+func (s *Store) GetRole(scope, name string) (*api.Role, error) {
+	row := s.db.QueryRow(`SELECT rules_json, metadata_json FROM roles WHERE scope=? AND name=?`, scope, name)
+	var rulesJ, metaJ string
+	if err := row.Scan(&rulesJ, &metaJ); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	r := &api.Role{APIVersion: "rbac.mk.io/v1", Kind: scope}
+	_ = json.Unmarshal([]byte(rulesJ), &r.Rules)
+	_ = json.Unmarshal([]byte(metaJ), &r.Metadata)
+	return r, nil
+}
+
+func (s *Store) ListRoles(scope string) ([]*api.Role, error) {
+	rows, err := s.db.Query(`SELECT rules_json, metadata_json FROM roles WHERE scope=? ORDER BY created_at ASC`, scope)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*api.Role
+	for rows.Next() {
+		var rulesJ, metaJ string
+		if err := rows.Scan(&rulesJ, &metaJ); err != nil {
+			return nil, err
+		}
+		r := &api.Role{APIVersion: "rbac.mk.io/v1", Kind: scope}
+		_ = json.Unmarshal([]byte(rulesJ), &r.Rules)
+		_ = json.Unmarshal([]byte(metaJ), &r.Metadata)
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) DeleteRole(scope, name string) error {
+	res, err := s.db.Exec(`DELETE FROM roles WHERE scope=? AND name=?`, scope, name)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ---------------- RoleBindings ----------------
+// scope is "RoleBinding" or "ClusterRoleBinding".
+
+func (s *Store) UpsertRoleBinding(scope string, b *api.RoleBinding) error {
+	now := time.Now().UTC()
+	subB, _ := json.Marshal(b.Subjects)
+	refB, _ := json.Marshal(b.RoleRef)
+	metaB, _ := json.Marshal(b.Metadata)
+	_, err := s.db.Exec(`INSERT INTO role_bindings(name, scope, namespace, subjects_json, roleref_json, metadata_json, created_at)
+		VALUES(?,?,?,?,?,?,?)
+		ON CONFLICT(scope, name) DO UPDATE SET namespace=excluded.namespace, subjects_json=excluded.subjects_json, roleref_json=excluded.roleref_json, metadata_json=excluded.metadata_json`,
+		b.Metadata.Name, scope, nsOrDefault(b.Metadata.Namespace), string(subB), string(refB), string(metaB), now)
+	return err
+}
+
+func (s *Store) ListRoleBindings(scope string) ([]*api.RoleBinding, error) {
+	rows, err := s.db.Query(`SELECT subjects_json, roleref_json, metadata_json FROM role_bindings WHERE scope=? ORDER BY created_at ASC`, scope)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*api.RoleBinding
+	for rows.Next() {
+		var subJ, refJ, metaJ string
+		if err := rows.Scan(&subJ, &refJ, &metaJ); err != nil {
+			return nil, err
+		}
+		b := &api.RoleBinding{APIVersion: "rbac.mk.io/v1", Kind: scope}
+		_ = json.Unmarshal([]byte(subJ), &b.Subjects)
+		_ = json.Unmarshal([]byte(refJ), &b.RoleRef)
+		_ = json.Unmarshal([]byte(metaJ), &b.Metadata)
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) DeleteRoleBinding(scope, name string) error {
+	res, err := s.db.Exec(`DELETE FROM role_bindings WHERE scope=? AND name=?`, scope, name)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (s *Store) ListEndpoints() ([]*api.Endpoints, error) {
